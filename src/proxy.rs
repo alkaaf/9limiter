@@ -23,6 +23,8 @@ pub struct AppState {
     pub tz: chrono::FixedOffset,
     pub stats_tx: tokio::sync::mpsc::UnboundedSender<(String, String, String, u64)>,
     pub stats_handle: Arc<StatsHandle>,
+    pub request_log_tx: tokio::sync::mpsc::UnboundedSender<crate::stats::RequestLog>,
+    pub stats_db_path: String,
 }
 
 pub async fn proxy_handler(
@@ -240,10 +242,21 @@ async fn proxy_to_upstream(
                 &state.tz);
 
             let _ = state.event_tx.send(AppEvent::RequestEnd(RequestEndEvent {
-                id: req_id,
+                id: req_id.clone(),
                 status,
                 latency_ms: latency,
             }));
+            let _ = state.request_log_tx.send(crate::stats::RequestLog {
+                id: req_id.clone(),
+                api_key: api_key.to_string(),
+                owner: owner.clone(),
+                model: model.to_string(),
+                method: parts.method.to_string(),
+                path: parts.uri.path_and_query().map(|pq| pq.to_string()).unwrap_or_default(),
+                status,
+                latency_ms: latency,
+                timestamp: chrono::Utc::now().with_timezone(&state.tz).to_rfc3339(),
+            });
 
             let mut response = Response::new(Body::from(body_bytes));
             *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -256,10 +269,21 @@ async fn proxy_to_upstream(
                 format!("req={} upstream error ({}): key={:.12} model={}", &req_id[..8], status, &api_key, &model),
                 &state.tz);
             let _ = state.event_tx.send(AppEvent::RequestEnd(RequestEndEvent {
-                id: req_id,
+                id: req_id.clone(),
                 status,
                 latency_ms: start.elapsed().as_millis() as u64,
             }));
+            let _ = state.request_log_tx.send(crate::stats::RequestLog {
+                id: req_id.clone(),
+                api_key: api_key.to_string(),
+                owner,
+                model: model.to_string(),
+                method: parts.method.to_string(),
+                path: parts.uri.path_and_query().map(|pq| pq.to_string()).unwrap_or_default(),
+                status: status as u16,
+                latency_ms: start.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().with_timezone(&state.tz).to_rfc3339(),
+            });
             (StatusCode::from_u16(status).unwrap(), "upstream error").into_response()
         }
     }

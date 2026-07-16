@@ -140,6 +140,10 @@ impl StatsHandle {
         ) {
             tracing::error!("stats cleanup delete error: {}", e);
         }
+        let _ = conn.execute(
+            "DELETE FROM request_logs WHERE timestamp < datetime('now', '-60 days')",
+            [],
+        );
     }
 
     pub fn query(&self, start: &str, end: &str) -> (Vec<ModelStat>, Vec<UserStat>) {
@@ -274,6 +278,45 @@ impl RequestLogWriter {
             }
         )?;
         rows.collect()
+    }
+}
+
+pub fn spawn_request_log_writer(db_path: String, rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<RequestLog>>>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let mut batch = Vec::new();
+            {
+                let mut rx = rx.lock().unwrap();
+                while let Ok(item) = rx.try_recv() {
+                    batch.push(item);
+                }
+            }
+            if !batch.is_empty() {
+                if let Err(e) = RequestLogWriter::flush_batch(&db_path, &batch) {
+                    tracing::error!("request_log flush error: {}", e);
+                }
+            }
+        }
+    });
+}
+
+pub async fn requests_handler(
+    State(state): State<crate::proxy::AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let range = params.get("range").map(|s| s.as_str()).unwrap_or("24h");
+    let now = chrono::Utc::now();
+    let (start, end) = match range {
+        "3d"  => (now - chrono::Duration::days(3), now),
+        "7d"  => (now - chrono::Duration::days(7), now),
+        "15d" => (now - chrono::Duration::days(15), now),
+        "30d" => (now - chrono::Duration::days(30), now),
+        _     => (now - chrono::Duration::hours(24), now),
+    };
+    match RequestLogWriter::query_logs(&state.stats_db_path, &start.to_rfc3339(), &end.to_rfc3339(), 200) {
+        Ok(logs) => axum::Json(serde_json::json!(logs)),
+        Err(_) => axum::Json(serde_json::json!([])),
     }
 }
 
@@ -460,5 +503,26 @@ mod tests {
         assert_eq!(results[0].id, "new");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_request_log_parse_range() {
+        fn parse_range(range: &str) -> (String, String) {
+            let now = chrono::Utc::now();
+            let (start, end) = match range {
+                "24h" => (now - chrono::Duration::hours(24), now),
+                "3d"  => (now - chrono::Duration::days(3), now),
+                "7d"  => (now - chrono::Duration::days(7), now),
+                "15d" => (now - chrono::Duration::days(15), now),
+                "30d" => (now - chrono::Duration::days(30), now),
+                _ => (now - chrono::Duration::days(1), now),
+            };
+            (start.to_rfc3339(), end.to_rfc3339())
+        }
+
+        let (s, e) = parse_range("24h");
+        assert!(s < e);
+        let (s, e) = parse_range("30d");
+        assert!(s < e);
     }
 }

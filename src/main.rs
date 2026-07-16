@@ -228,9 +228,15 @@ async fn main() {
     // Init stats collector
     let key_owners = Arc::new(key_owners);
     let stats_db = format!("{}/stats.db", config_path.parent().unwrap_or(std::path::Path::new("~/.9limiter")).display());
-    let (stats_collector, stats_handle) = stats::StatsCollector::new(stats_db, key_owners.clone());
+    let (stats_collector, stats_handle) = stats::StatsCollector::new(stats_db.clone(), key_owners.clone());
     let stats_handle = Arc::new(stats_handle);
     stats_handle.start();
+
+    // Init request log writer
+    let (rl_tx, rl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let rl_rx = Arc::new(std::sync::Mutex::new(rl_rx));
+    stats::RequestLogWriter::init_db(&stats_db);
+    stats::spawn_request_log_writer(stats_db.clone(), rl_rx);
 
     let state = proxy::AppState {
         config: config.clone(),
@@ -241,6 +247,8 @@ async fn main() {
         tz,
         stats_tx: stats_collector.sender.clone(),
         stats_handle: stats_handle.clone(),
+        request_log_tx: rl_tx.clone(),
+        stats_db_path: stats_db.clone(),
     };
 
     // Start hot-reload watcher
@@ -253,6 +261,7 @@ async fn main() {
         .route("/dashboard", axum::routing::get(dashboard::dashboard_handler))
         .route("/stats", axum::routing::get(stats::stats_page_handler))
         .route("/api/stats", axum::routing::get(stats::stats_handler))
+        .route("/api/requests", axum::routing::get(stats::requests_handler))
         .route("/_ws", axum::routing::get(dashboard::ws_handler))
         .fallback(proxy::proxy_handler)
         .with_state(state);
