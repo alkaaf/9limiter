@@ -104,6 +104,7 @@ async fn config_reload_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Rule;
 
     #[test]
     fn test_parse_config() {
@@ -121,7 +122,23 @@ mod tests {
         assert!(limiter.check("key1", "gpt-4", 3, 60).0);
         assert!(limiter.check("key1", "gpt-4", 3, 60).0);
         assert!(!limiter.check("key1", "gpt-4", 3, 60).0);
-
         assert!(limiter.check("key2", "gpt-4", 3, 60).0);
+    }
+
+    #[test]
+    fn test_rule_matching() {
+        let rule = Rule {
+            model: "gpt-4".into(),
+            limit: 100,
+            window_secs: 3600,
+            time_start: "07:00".into(),
+            time_end: "17:00".into(),
+            days: vec!["Mon".into(), "Tue".into(), "Wed".into(), "Thu".into(), "Fri".into()],
+        };
+        assert!(proxy::rule_matches(&rule, "gpt-4", "Mon", "10:00"));
+        assert!(!proxy::rule_matches(&rule, "gpt-4", "Sat", "10:00"));
+        assert!(!proxy::rule_matches(&rule, "gpt-4", "Mon", "18:00"));
+        assert!(!proxy::rule_matches(&rule, "claude-3", "Mon", "10:00"));
+        assert!(!proxy::rule_matches(&rule, "gpt-4", "Mon", "06:59"));
     }
 }
