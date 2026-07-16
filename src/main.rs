@@ -251,6 +251,8 @@ async fn main() {
     let app = axum::Router::new()
         .route("/", axum::routing::get(dashboard::dashboard_handler))
         .route("/dashboard", axum::routing::get(dashboard::dashboard_handler))
+        .route("/stats", axum::routing::get(stats::stats_page_handler))
+        .route("/api/stats", axum::routing::get(stats::stats_handler))
         .route("/_ws", axum::routing::get(dashboard::ws_handler))
         .fallback(proxy::proxy_handler)
         .with_state(state);

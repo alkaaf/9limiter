@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use axum::{extract::State, response::IntoResponse};
 use rusqlite::Connection;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -176,4 +177,18 @@ impl StatsHandle {
 
         (models, users)
     }
+}
+
+pub async fn stats_handler(
+    State(state): State<crate::proxy::AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let start = params.get("start").cloned().unwrap_or_default();
+    let end = params.get("end").cloned().unwrap_or_default();
+    let (models, users) = state.stats_handle.query(&start, &end);
+    axum::Json(serde_json::json!({ "models": models, "users": users }))
+}
+
+pub async fn stats_page_handler() -> impl IntoResponse {
+    axum::response::Html(include_str!("stats.html"))
 }

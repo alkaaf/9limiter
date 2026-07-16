@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9limiter &mdash; Stats</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f0f1a;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
+  header{background:#1a1a2e;padding:12px 24px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2a2a4a}
+  header h1{font-size:18px;font-weight:600}
+  nav{display:flex;gap:16px;font-size:13px}
+  nav a{color:#666;text-decoration:none;padding:4px 10px;border-radius:4px}
+  nav a.active{color:#e0e0e0;background:#2a2a4a}
+  .content{padding:20px 24px;flex:1;overflow-y:auto}
+  .slider-section{background:#1a1a2e;border-radius:8px;padding:20px;margin-bottom:20px;border:1px solid #2a2a4a}
+  .slider-section h3{font-size:12px;text-transform:uppercase;color:#888;margin-bottom:16px;letter-spacing:.5px}
+  .slider-wrap{position:relative;height:40px;margin:0 10px 8px}
+  .slider-wrap input[type=range]{position:absolute;width:100%;-webkit-appearance:none;appearance:none;background:transparent;pointer-events:none;height:40px;z-index:2}
+  .slider-wrap input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:18px;height:18px;border-radius:50%;background:#4fc3f7;cursor:pointer;pointer-events:auto;border:2px solid #0f0f1a;margin-top:-5px}
+  .slider-wrap input[type=range]::-webkit-slider-runnable-track{height:8px;background:#2a2a4a;border-radius:4px}
+  .slider-track{position:absolute;top:16px;left:0;right:0;height:8px;background:#2a2a4a;border-radius:4px;z-index:1}
+  .slider-fill{position:absolute;top:16px;height:8px;background:#4fc3f7;border-radius:4px;z-index:1;opacity:.4;transition:left .15s,width .15s}
+  .slider-labels{display:flex;justify-content:space-between;font-size:10px;color:#666;margin:4px 10px 0}
+  .time-label{text-align:center;font-size:12px;color:#aaa;margin-top:8px;font-family:monospace}
+  .boards{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .board{background:#1a1a2e;border-radius:8px;border:1px solid #2a2a4a;overflow:hidden}
+  .board h3{font-size:12px;text-transform:uppercase;color:#888;padding:12px 16px;border-bottom:1px solid #2a2a4a;letter-spacing:.5px}
+  .board-list{padding:8px 16px 12px}
+  .bar-row{display:flex;align-items:center;gap:10px;padding:5px 0}
+  .bar-row .label{font-size:12px;font-family:monospace;min-width:80px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar-row .owner{font-size:10px;color:#666;min-width:60px;overflow:hidden;text-overflow:ellipsis}
+  .bar-track-item{flex:1;height:22px;background:#2a2a4a;border-radius:4px;overflow:hidden;position:relative}
+  .bar-fill-item{height:100%;border-radius:4px;transition:width .5s ease;background:linear-gradient(90deg,#4fc3f7,#2196f3)}
+  .bar-row .tcount{font-size:11px;color:#888;min-width:60px;text-align:right;font-family:monospace}
+  .empty-state{text-align:center;color:#555;padding:40px;font-size:14px}
+  .nav-links{display:flex;gap:8px}
+  @media(max-width:768px){.boards{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>9limiter</h1>
+  <div class="nav-links">
+    <div style="font-size:13px;color:#888;font-family:monospace" id="clock"></div>
+    <nav>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/stats" class="active">Stats</a>
+    </nav>
+  </div>
+</header>
+<div class="content">
+  <div class="slider-section">
+    <h3>Time Range</h3>
+    <div class="slider-wrap">
+      <div class="slider-track"></div>
+      <div class="slider-fill" id="slider-fill"></div>
+      <input type="range" id="range-start" min="0" max="100" value="0" step="1">
+      <input type="range" id="range-end" min="0" max="100" value="100" step="1">
+    </div>
+    <div class="time-label" id="time-label">—</div>
+  </div>
+  <div class="boards">
+    <div class="board">
+      <h3>Top Models</h3>
+      <div class="board-list" id="model-board"><div class="empty-state">Select a time range</div></div>
+    </div>
+    <div class="board">
+      <h3>Top Users</h3>
+      <div class="board-list" id="user-board"><div class="empty-state">Select a time range</div></div>
+    </div>
+  </div>
+</div>
+<script>
+const RANGE_DAYS = 49; // 7 weeks
+const now = new Date();
+const endDate = new Date(now);
+const startDate = new Date(now);
+startDate.setDate(startDate.getDate() - RANGE_DAYS);
+
+function fmtISO(d) {
+  const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), day = String(d.getDate()).padStart(2,'0');
+  const h = String(d.getHours()).padStart(2,'0');
+  return y+'-'+m+'-'+day+'T'+h+':00:00+07:00';
+}
+
+function valToDate(val) {
+  const d = new Date(startDate);
+  d.setHours(d.getHours() + Math.round(val / 100 * RANGE_DAYS * 24));
+  return d;
+}
+
+const startSlider = document.getElementById('range-start');
+const endSlider = document.getElementById('range-end');
+const fill = document.getElementById('slider-fill');
+const label = document.getElementById('time-label');
+const modelBoard = document.getElementById('model-board');
+const userBoard = document.getElementById('user-board');
+
+function fmtDate(d) {
+  return d.toLocaleDateString('id-ID', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', timeZone:'UTC'});
+}
+
+function update() {
+  let s = parseInt(startSlider.value), e = parseInt(endSlider.value);
+  if (s >= e) { if (e < 100) startSlider.value = s = e - 1; else endSlider.value = e = s + 1; }
+  const pctS = s, pctE = e;
+  fill.style.left = pctS + '%';
+  fill.style.width = (pctE - pctS) + '%';
+
+  const ds = valToDate(pctS), de = valToDate(pctE);
+  label.textContent = fmtDate(ds) + ' — ' + fmtDate(de);
+  fetchStats(fmtISO(ds), fmtISO(de));
+}
+
+async function fetchStats(start, end) {
+  try {
+    const r = await fetch('/api/stats?start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end));
+    const data = await r.json();
+    renderBoard(modelBoard, data.models, 'model', null);
+    renderBoard(userBoard, data.users, 'api_key', 'owner');
+  } catch(e) {}
+}
+
+function shortKey(k){return k&&k.length>12?k.slice(0,12)+'…':k||''}
+
+function renderBoard(el, items, nameKey, ownerKey) {
+  if (!items || items.length === 0) { el.innerHTML = '<div class="empty-state">No data for this period</div>'; return; }
+  const max = items[0].tokens;
+  let html = '';
+  for (const item of items) {
+    const pct = item.tokens / max * 100;
+    const label = nameKey === 'model' ? item[nameKey] : shortKey(item[nameKey]);
+    const owner = ownerKey ? (item[ownerKey]||'') : '';
+    html += '<div class="bar-row"><span class="label" title="'+item[nameKey]+'">'+label+'</span>'+
+      (owner ? '<span class="owner">'+owner+'</span>' : '')+
+      '<div class="bar-track-item"><div class="bar-fill-item" style="width:'+pct+'%"></div></div>'+
+      '<span class="tcount">'+item.tokens.toLocaleString()+'</span></div>';
+  }
+  el.innerHTML = html;
+}
+
+// Clock
+(function tick(){const c=document.getElementById('clock');if(c){const d=new Date();c.textContent=d.toLocaleString('id-ID',{hour12:false,timeZone:'UTC'});}setTimeout(tick,1000);})();
+
+startSlider.addEventListener('change', update);
+endSlider.addEventListener('change', update);
+startSlider.addEventListener('input', update);
+endSlider.addEventListener('input', update);
+update();
+</script>
+</body>
+</html>
