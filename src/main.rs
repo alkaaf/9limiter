@@ -12,8 +12,12 @@ use std::sync::Arc;
 use std::path::PathBuf;
 
 fn default_config_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    format!("{}/.9limiter/config.yaml", home)
+    let user = std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "root".to_string());
+    if user == "root" {
+        "/root/.9limiter/config.yaml".to_string()
+    } else {
+        format!("/home/{}/.9limiter/config.yaml", user)
+    }
 }
 
 fn parse_tz(s: &str) -> chrono::FixedOffset {
@@ -30,6 +34,12 @@ fn binary_path() -> String {
 }
 
 fn service_unit(config: &str) -> String {
+    let cfg_path = if config.starts_with('/') {
+        config.to_string()
+    } else {
+        let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        format!("{}/{}", cwd, config)
+    };
     let exe = binary_path();
     format!(
         "[Unit]\n\
@@ -46,7 +56,7 @@ fn service_unit(config: &str) -> String {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
-        exe, config
+        exe, cfg_path
     )
 }
 
@@ -82,6 +92,24 @@ enum DaemonCmd {
 }
 
 fn run_daemon(cmd: &DaemonCmd, config: &str) {
+    // Re-exec via sudo if not root
+    fn is_root() -> bool { std::process::Command::new("id").arg("-u").output().map(|o| std::str::from_utf8(&o.stdout).unwrap_or("").trim() == "0").unwrap_or(false) }
+    if !is_root() {
+        let exe = binary_path();
+        let subcmd = match cmd {
+            DaemonCmd::Install { .. } => "install",
+            DaemonCmd::Start {} => "start",
+            DaemonCmd::Stop {} => "stop",
+            DaemonCmd::Restart {} => "restart",
+            DaemonCmd::Remove {} => "remove",
+        };
+        let status = std::process::Command::new("sudo")
+            .args([&exe, "--config", config, subcmd])
+            .status()
+            .expect("failed to exec sudo");
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
     let unit = unit_path();
     match cmd {
         DaemonCmd::Install { .. } => {
