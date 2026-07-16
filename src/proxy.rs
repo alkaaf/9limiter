@@ -10,6 +10,7 @@ use crate::{
     config::Config,
     events::{self, AppEvent, RequestStartEvent, RequestEndEvent},
     limiter::SlidingLimiter,
+    stats::StatsHandle,
 };
 
 #[derive(Clone)]
@@ -20,6 +21,8 @@ pub struct AppState {
     pub upstream_idx: Arc<Mutex<HashMap<String, usize>>>,
     pub key_owners: Arc<HashMap<String, String>>,
     pub tz: chrono::FixedOffset,
+    pub stats_tx: tokio::sync::mpsc::UnboundedSender<(String, String, String, u64)>,
+    pub stats_handle: Arc<StatsHandle>,
 }
 
 pub async fn proxy_handler(

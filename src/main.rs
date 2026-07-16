@@ -4,6 +4,7 @@ mod events;
 mod proxy;
 mod dashboard;
 mod db;
+mod stats;
 
 use clap::{Parser, Subcommand};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, Watcher};
@@ -224,13 +225,22 @@ async fn main() {
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let limiter = limiter::SlidingLimiter::new();
 
+    // Init stats collector
+    let key_owners = Arc::new(key_owners);
+    let stats_db = format!("{}/stats.db", config_path.parent().unwrap_or(std::path::Path::new("~/.9limiter")).display());
+    let (stats_collector, stats_handle) = stats::StatsCollector::new(stats_db, key_owners.clone());
+    let stats_handle = Arc::new(stats_handle);
+    stats_handle.start();
+
     let state = proxy::AppState {
         config: config.clone(),
         limiter,
         event_tx: event_tx.clone(),
         upstream_idx: Default::default(),
-        key_owners: Arc::new(key_owners),
+        key_owners: key_owners.clone(),
         tz,
+        stats_tx: stats_collector.sender.clone(),
+        stats_handle: stats_handle.clone(),
     };
 
     // Start hot-reload watcher
