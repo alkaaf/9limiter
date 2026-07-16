@@ -157,6 +157,21 @@ fn send_log(tx: &tokio::sync::broadcast::Sender<AppEvent>, level: &str, msg: Str
     }));
 }
 
+fn extract_usage(body: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    // OpenAI: usage.total_tokens
+    if let Some(total) = v.get("usage")?.get("total_tokens").and_then(|x| x.as_u64()) {
+        return Some(total);
+    }
+    // Anthropic: usage.input_tokens + usage.output_tokens
+    if let Some(u) = v.get("usage") {
+        let inp = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        let out = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        if inp + out > 0 { return Some(inp + out); }
+    }
+    None
+}
+
 fn extract_model(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string())
@@ -207,6 +222,19 @@ async fn proxy_to_upstream(
                 .cloned()
                 .unwrap_or_else(|| header::HeaderValue::from_static("application/json"));
 
+            // Read full body to extract token usage, then reconstruct
+            let body_bytes = match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 10 * 1024 * 1024).await {
+                Ok(b) => b,
+                Err(_) => return (StatusCode::BAD_GATEWAY, "failed to read upstream body").into_response(),
+            };
+
+            // Extract token usage and send to stats
+            if let Some(tokens) = extract_usage(&body_bytes) {
+                let model_family = model.split('/').next().unwrap_or(&model).to_string();
+                let hour = chrono::Utc::now().with_timezone(&state.tz).format("%Y-%m-%dT%H:00:00%:z").to_string();
+                let _ = state.stats_tx.send((api_key.to_string(), model_family, hour, tokens));
+            }
+
             send_log(&state.event_tx, "info",
                 format!("req={} {} {}ms key={:.12} model={} owner={}", &req_id[..8], status, latency, &api_key, &model, &owner),
                 &state.tz);
@@ -217,8 +245,7 @@ async fn proxy_to_upstream(
                 latency_ms: latency,
             }));
 
-            let body = Body::from_stream(resp.bytes_stream());
-            let mut response = Response::new(body);
+            let mut response = Response::new(Body::from(body_bytes));
             *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             response.headers_mut().insert(header::CONTENT_TYPE, content_type);
             response
