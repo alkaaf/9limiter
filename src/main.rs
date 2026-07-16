@@ -11,6 +11,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::PathBuf;
 
+fn default_config_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    format!("{}/.9limiter/config.yaml", home)
+}
+
 fn parse_tz(s: &str) -> chrono::FixedOffset {
     s.parse().unwrap_or_else(|_| {
         tracing::warn!("invalid timezone '{}', falling back to +07:00", s);
@@ -54,7 +59,7 @@ struct Args {
     #[command(subcommand)]
     cmd: Option<DaemonCmd>,
 
-    #[arg(long, default_value = "config.yaml")]
+    #[arg(long, default_value_t = default_config_path())]
     config: String,
     #[arg(long)]
     listen: Option<String>,
@@ -130,6 +135,20 @@ fn run_daemon(cmd: &DaemonCmd, config: &str) {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // Ensure config file exists — write default if missing
+    let config_path = PathBuf::from(&args.config);
+    if !config_path.exists() {
+        if let Some(parent) = config_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let default = include_str!("../config.default.yaml");
+        std::fs::write(&config_path, default).expect("failed to write default config");
+        tracing_subscriber::fmt()
+            .with_env_filter(&args.log_level)
+            .init();
+        tracing::info!("created default config at {}", config_path.display());
+    }
 
     if let Some(ref cmd) = args.cmd {
         run_daemon(cmd, &args.config);
