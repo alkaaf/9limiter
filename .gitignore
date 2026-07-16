@@ -2,3 +2,4 @@
 .superpowers/
 *.yaml
 !config.yaml
+!config.default.yaml

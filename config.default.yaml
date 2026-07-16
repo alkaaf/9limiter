@@ -1,0 +1,20 @@
+listen: "0.0.0.0:8080"
+timezone: "+07:00"
+
+upstreams:
+  - path_prefix: "/v1"
+    base_url: "http://localhost:8080/v1"
+
+fallback_ruleset: default
+
+rulesets:
+  - name: default
+    rules:
+      - model: "*"
+        limit: 10
+        window_secs: 3600
+        time_start: "00:00"
+        time_end: "23:59"
+        days: [Mon, Tue, Wed, Thu, Fri, Sat, Sun]
+
+api_keys: []
