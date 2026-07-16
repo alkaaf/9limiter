@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use crate::{
     config::Config,
-    events::{AppEvent, RequestStartEvent, RequestEndEvent},
+    events::{self, AppEvent, RequestStartEvent, RequestEndEvent},
     limiter::SlidingLimiter,
 };
 
@@ -18,6 +18,8 @@ pub struct AppState {
     pub limiter: SlidingLimiter,
     pub event_tx: tokio::sync::broadcast::Sender<AppEvent>,
     pub upstream_idx: Arc<Mutex<HashMap<String, usize>>>,
+    pub key_owners: Arc<HashMap<String, String>>,
+    pub tz: chrono::FixedOffset,
 }
 
 pub async fn proxy_handler(
@@ -42,6 +44,11 @@ pub async fn proxy_handler(
     };
 
     let model = extract_model(&bytes).unwrap_or_else(|| "*".to_string());
+    let req_id = uuid::Uuid::new_v4().to_string();
+    let owner = state.key_owners.get(&api_key).cloned().unwrap_or_default();
+    send_log(&state.event_tx, "info",
+        format!("req={} {} {} model={} key={:.12} owner={}", &req_id[..8], parts.method, parts.uri.path(), &model, &api_key, &owner),
+        &state.tz);
 
     // Phase 1: rate limit check — clone rule data to drop config guard
     let matching_rules: Vec<(u32, u64)> = {
@@ -50,7 +57,7 @@ pub async fn proxy_handler(
             Some(name) => name.to_string(),
             None => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
         };
-        let now = chrono::Local::now();
+        let now = chrono::Utc::now().with_timezone(&state.tz);
         let day_name = now.format("%a").to_string();
         let time_str = now.format("%H:%M").to_string();
 
@@ -65,8 +72,14 @@ pub async fn proxy_handler(
 
     for &(limit, window_secs) in &matching_rules {
         let (passed, event) = state.limiter.check(&api_key, &model, limit, window_secs);
-        let _ = state.event_tx.send(AppEvent::RateLimit(event));
-        if !passed {
+        let mut event = event; event.owner = state.key_owners.get(&api_key).cloned().unwrap_or_default();
+        let _ = state.event_tx.send(AppEvent::RateLimit(event.clone()));
+        if passed {
+            tracing::debug!("req={} rl=pass limit={} count={}", &req_id[..8], limit, event.count);
+        } else {
+            send_log(&state.event_tx, "warn",
+                format!("req={} rate-limit BLOCKED ({}/{}) key={:.12} model={} owner={}", &req_id[..8], event.count, limit, &api_key, &model, &event.owner),
+                &state.tz);
             let body = serde_json::json!({
                 "error": "rate_limit_exceeded",
                 "message": format!("Rate limit exceeded for model {}", model),
@@ -108,13 +121,19 @@ pub async fn proxy_handler(
 }
 
 pub fn rule_matches(rule: &crate::config::Rule, model: &str, day: &str, time: &str) -> bool {
-    if rule.model != "*" && rule.model != model {
+    if !rule.models.iter().any(|m| m == "*" || m == model) {
         return false;
     }
     if !rule.days.iter().any(|d| d == day) {
         return false;
     }
-    time >= rule.time_start.as_str() && time < rule.time_end.as_str()
+    if rule.time_start < rule.time_end {
+        // Normal window (07:00-17:30)
+        time >= rule.time_start.as_str() && time < rule.time_end.as_str()
+    } else {
+        // Overnight window (22:00-07:00)
+        time >= rule.time_start.as_str() || time < rule.time_end.as_str()
+    }
     // ponytail: string compare for HH:MM — fine until we need timezone-aware scheduling
 }
 
@@ -125,6 +144,14 @@ fn lookup_ruleset<'a>(config: &'a Config, api_key: &str) -> Option<&'a str> {
         }
     }
     config.fallback_ruleset.as_deref()
+}
+
+fn send_log(tx: &tokio::sync::broadcast::Sender<AppEvent>, level: &str, msg: String, tz: &chrono::FixedOffset) {
+    let _ = tx.send(AppEvent::Log(events::LogEvent {
+        time: chrono::Utc::now().with_timezone(tz).format("%H:%M:%S").to_string(),
+        level: level.to_string(),
+        msg,
+    }));
 }
 
 fn extract_model(body: &[u8]) -> Option<String> {
@@ -143,6 +170,10 @@ async fn proxy_to_upstream(
     let req_id = uuid::Uuid::new_v4().to_string();
     let start = std::time::Instant::now();
 
+    tracing::debug!("req={} proxying to {} (key={:.12}, model={})", &req_id[..8], upstream_url, &api_key, &model);
+
+    let owner = state.key_owners.get(api_key).cloned().unwrap_or_default();
+
     let _ = state.event_tx.send(AppEvent::Request(RequestStartEvent {
         id: req_id.clone(),
         api_key: api_key.to_string(),
@@ -151,7 +182,8 @@ async fn proxy_to_upstream(
         path: parts.uri.path_and_query()
             .map(|pq| pq.to_string())
             .unwrap_or_default(),
-        timestamp: chrono::Local::now().to_rfc3339(),
+        timestamp: chrono::Utc::now().with_timezone(&state.tz).to_rfc3339(),
+        owner: owner.clone(),
     }));
 
     let client = reqwest::Client::new();
@@ -172,6 +204,10 @@ async fn proxy_to_upstream(
                 .cloned()
                 .unwrap_or_else(|| header::HeaderValue::from_static("application/json"));
 
+            send_log(&state.event_tx, "info",
+                format!("req={} {} {}ms key={:.12} model={} owner={}", &req_id[..8], status, latency, &api_key, &model, &owner),
+                &state.tz);
+
             let _ = state.event_tx.send(AppEvent::RequestEnd(RequestEndEvent {
                 id: req_id,
                 status,
@@ -185,8 +221,10 @@ async fn proxy_to_upstream(
             response
         }
         Err(e) => {
-            tracing::error!("upstream error: {}", e);
             let status = if e.is_timeout() { 504 } else { 502 };
+            send_log(&state.event_tx, "error",
+                format!("req={} upstream error ({}): key={:.12} model={}", &req_id[..8], status, &api_key, &model),
+                &state.tz);
             let _ = state.event_tx.send(AppEvent::RequestEnd(RequestEndEvent {
                 id: req_id,
                 status,

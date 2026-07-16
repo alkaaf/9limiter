@@ -11,6 +11,7 @@ pub struct RateLimitEvent {
     pub count: usize,
     pub remaining: u32,
     pub reset_after_secs: u64,
+    pub owner: String,
 }
 
 #[derive(Clone)]
@@ -66,6 +67,57 @@ impl SlidingLimiter {
             count,
             remaining,
             reset_after_secs,
+            owner: String::new(),
         })
+    }
+
+    /// Return snapshot of all active counters as RateLimitEvents.
+    /// Expired entries are cleaned before returning.
+    pub fn snapshot(&self) -> Vec<RateLimitEvent> {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        let mut events = Vec::new();
+
+        state.retain(|_key, deque| {
+            // Pop expired
+            while let Some(&t) = deque.front() {
+                if now.duration_since(t) >= std::time::Duration::from_secs(86400 * 7) {
+                    deque.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !deque.is_empty()
+        });
+
+        for (key, deque) in state.iter() {
+            // key = "api_key:model:limit:window_secs"
+            let parts: Vec<&str> = key.splitn(4, ':').collect();
+            if parts.len() != 4 { continue; }
+            let limit: u32 = parts[2].parse().unwrap_or(0);
+            let window_secs: u64 = parts[3].parse().unwrap_or(0);
+            let count = deque.len();
+
+            let (api_key, model) = (parts[0], parts[1]);
+            let remaining = limit.saturating_sub(count as u32);
+            let reset_after_secs = deque.front()
+                .map(|oldest| {
+                    let elapsed = now.duration_since(*oldest).as_secs();
+                    window_secs.saturating_sub(elapsed)
+                })
+                .unwrap_or(0);
+
+            events.push(RateLimitEvent {
+                api_key: api_key.to_string(),
+                model: model.to_string(),
+                rule_limit: limit,
+                rule_window_secs: window_secs,
+                count,
+                remaining,
+                reset_after_secs,
+                owner: String::new(),
+            });
+        }
+        events
     }
 }

@@ -8,6 +8,17 @@ pub struct Config {
     pub fallback_ruleset: Option<String>,
     pub rulesets: Vec<Ruleset>,
     pub api_keys: Vec<ApiKeyEntry>,
+    pub database: Option<DatabaseConfig>,
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatabaseConfig {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub dbname: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -22,9 +33,23 @@ pub struct Ruleset {
     pub rules: Vec<Rule>,
 }
 
+fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany { One(String), Many(Vec<String>) }
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(v) => Ok(v),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Rule {
-    pub model: String,
+    #[serde(deserialize_with = "string_or_vec", alias = "model")]
+    pub models: Vec<String>,
     pub limit: u32,
     pub window_secs: u64,
     pub time_start: String,
@@ -89,11 +114,8 @@ impl Config {
                         );
                     }
                 }
-                if rule.time_start >= rule.time_end {
-                    return Err(
-                        format!("ruleset '{}': time_start must be < time_end", rs.name).into(),
-                    );
-                }
+                // Overnight window allowed (e.g. 22:00-07:00) — skip enforce
+                // ponytail: overnight overlap detection is best-effort
                 let valid_days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
                 for d in &rule.days {
                     if !valid_days.contains(&d.as_str()) {
@@ -120,8 +142,18 @@ impl Config {
     }
 }
 
+fn time_in_range(time: &str, start: &str, end: &str) -> bool {
+    if start < end {
+        time >= start && time < end
+    } else {
+        time >= start || time < end
+    }
+}
+
 fn rules_overlap(a: &Rule, b: &Rule) -> bool {
-    let model_match = a.model == "*" || b.model == "*" || a.model == b.model;
+    let model_match = a.models.iter().any(|m| m == "*")
+        || b.models.iter().any(|m| m == "*")
+        || a.models.iter().any(|m| b.models.contains(m));
     if !model_match {
         return false;
     }
@@ -132,5 +164,8 @@ fn rules_overlap(a: &Rule, b: &Rule) -> bool {
         return false;
     }
 
-    a.time_start < b.time_end && b.time_start < a.time_end
+    // Check temporal overlap with overnight support
+    time_in_range(&a.time_start, &b.time_start, &b.time_end)
+        || time_in_range(&a.time_end, &b.time_start, &b.time_end)
+        || time_in_range(&b.time_start, &a.time_start, &a.time_end)
 }

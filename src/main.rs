@@ -3,10 +3,19 @@ mod limiter;
 mod events;
 mod proxy;
 mod dashboard;
+mod db;
 
 use clap::Parser;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, Watcher};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+fn parse_tz(s: &str) -> chrono::FixedOffset {
+    s.parse().unwrap_or_else(|_| {
+        tracing::warn!("invalid timezone '{}', falling back to +07:00", s);
+        chrono::FixedOffset::east_opt(7 * 3600).unwrap()
+    })
+}
 
 #[derive(Parser)]
 struct Args {
@@ -28,7 +37,37 @@ async fn main() {
     let cfg = config::Config::from_file(&args.config)
         .expect("failed to parse config");
 
+    tracing::info!("loaded config from {}", args.config);
+    tracing::info!("{} rulesets configured", cfg.rulesets.len());
+    tracing::info!("{} api key entries configured", cfg.api_keys.iter().map(|e| e.keys.len()).sum::<usize>());
+
     let config = Arc::new(tokio::sync::RwLock::new(cfg));
+
+    // Load API key owners from PostgreSQL if configured
+    let key_owners = {
+        let cfg = config.read().await;
+        match &cfg.database {
+            Some(db) => {
+                let host = db.host.as_deref().unwrap_or("localhost");
+                let port = db.port.unwrap_or(5432);
+                let user = db.user.as_deref().unwrap_or("postgres");
+                let password = db.password.as_deref().unwrap_or("postgres");
+                let dbname = db.dbname.as_deref().unwrap_or("postgres");
+                db::fetch_key_names(host, port, user, password, dbname).await
+            }
+            None => {
+                tracing::info!("no database configured, skipping key owner lookup");
+                HashMap::new()
+            }
+        }
+    };
+    tracing::info!("loaded {} api key owners", key_owners.len());
+
+    let tz = {
+        let cfg = config.read().await;
+        parse_tz(cfg.timezone.as_deref().unwrap_or("+07:00"))
+    };
+
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let limiter = limiter::SlidingLimiter::new();
 
@@ -37,6 +76,8 @@ async fn main() {
         limiter,
         event_tx: event_tx.clone(),
         upstream_idx: Default::default(),
+        key_owners: Arc::new(key_owners),
+        tz,
     };
 
     // Start hot-reload watcher
@@ -53,10 +94,11 @@ async fn main() {
 
     let listen_addr = {
         let cfg = config.read().await;
-        args.listen.clone().or_else(|| cfg.listen.clone()).unwrap_or_else(|| ":8080".to_string())
+        args.listen.clone().or_else(|| cfg.listen.clone()).unwrap_or_else(|| "0.0.0.0:8080".to_string())
     };
 
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await
+        .expect(&format!("failed to bind to {}", listen_addr));
     tracing::info!("proxy ready on {}", listen_addr);
     let upstream_count = config.read().await.upstreams.len();
     tracing::info!("upstreams configured: {}", upstream_count);
@@ -91,6 +133,10 @@ async fn config_reload_loop(
     }
 
     while rx.recv().await.is_some() {
+        // debounce: wait for writes to settle, drain duplicate events
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        while rx.try_recv().is_ok() {}
+
         tracing::info!("config file changed, reloading...");
         match config::Config::from_file(&config_path) {
             Ok(new_config) => {
@@ -141,7 +187,7 @@ mod tests {
     #[test]
     fn test_rule_matching() {
         let rule = Rule {
-            model: "gpt-4".into(),
+            models: vec!["gpt-4".into()],
             limit: 100,
             window_secs: 3600,
             time_start: "07:00".into(),

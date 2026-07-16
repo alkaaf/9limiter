@@ -9,6 +9,7 @@ pub struct RequestStartEvent {
     pub method: String,
     pub path: String,
     pub timestamp: String,
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -16,6 +17,13 @@ pub struct RequestEndEvent {
     pub id: String,
     pub status: u16,
     pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogEvent {
+    pub time: String,
+    pub level: String,
+    pub msg: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,4 +35,6 @@ pub enum AppEvent {
     Request(RequestStartEvent),
     #[serde(rename = "request_end")]
     RequestEnd(RequestEndEvent),
+    #[serde(rename = "log")]
+    Log(LogEvent),
 }
