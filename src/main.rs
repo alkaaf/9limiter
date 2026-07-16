@@ -5,10 +5,11 @@ mod proxy;
 mod dashboard;
 mod db;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, Watcher};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::path::PathBuf;
 
 fn parse_tz(s: &str) -> chrono::FixedOffset {
     s.parse().unwrap_or_else(|_| {
@@ -17,8 +18,42 @@ fn parse_tz(s: &str) -> chrono::FixedOffset {
     })
 }
 
+fn binary_path() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "/usr/local/bin/ninelimiter".to_string())
+}
+
+fn service_unit(config: &str) -> String {
+    let exe = binary_path();
+    format!(
+        "[Unit]\n\
+         Description=9limiter rate-limiting proxy\n\
+         After=network.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={} --config {}\n\
+         Restart=always\n\
+         RestartSec=5\n\
+         StandardOutput=journal\n\
+         StandardError=journal\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        exe, config
+    )
+}
+
+fn unit_path() -> PathBuf {
+    PathBuf::from("/etc/systemd/system/ninelimiter.service")
+}
+
 #[derive(Parser)]
 struct Args {
+    #[command(subcommand)]
+    cmd: Option<DaemonCmd>,
+
     #[arg(long, default_value = "config.yaml")]
     config: String,
     #[arg(long)]
@@ -27,9 +62,80 @@ struct Args {
     log_level: String,
 }
 
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Install, start, and enable systemd service
+    Install {},
+    /// Start service
+    Start {},
+    /// Stop service
+    Stop {},
+    /// Restart service
+    Restart {},
+    /// Stop and remove service file
+    Remove {},
+}
+
+fn run_daemon(cmd: &DaemonCmd, config: &str) {
+    let unit = unit_path();
+    match cmd {
+        DaemonCmd::Install { .. } => {
+            let content = service_unit(config);
+            std::fs::write(&unit, content).expect("failed to write systemd unit (root?)");
+            std::process::Command::new("systemctl")
+                .args(["daemon-reload"])
+                .status().ok();
+            std::process::Command::new("systemctl")
+                .args(["enable", "ninelimiter"])
+                .status().ok();
+            std::process::Command::new("systemctl")
+                .args(["start", "ninelimiter"])
+                .status().ok();
+            println!("9limiter service installed and started.");
+        }
+        DaemonCmd::Start {} => {
+            std::process::Command::new("systemctl")
+                .args(["start", "ninelimiter"])
+                .status().ok();
+            println!("9limiter service started.");
+        }
+        DaemonCmd::Stop {} => {
+            std::process::Command::new("systemctl")
+                .args(["stop", "ninelimiter"])
+                .status().ok();
+            println!("9limiter service stopped.");
+        }
+        DaemonCmd::Restart {} => {
+            std::process::Command::new("systemctl")
+                .args(["restart", "ninelimiter"])
+                .status().ok();
+            println!("9limiter service restarted.");
+        }
+        DaemonCmd::Remove {} => {
+            std::process::Command::new("systemctl")
+                .args(["stop", "ninelimiter"])
+                .status().ok();
+            std::process::Command::new("systemctl")
+                .args(["disable", "ninelimiter"])
+                .status().ok();
+            let _ = std::fs::remove_file(&unit);
+            std::process::Command::new("systemctl")
+                .args(["daemon-reload"])
+                .status().ok();
+            println!("9limiter service removed.");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    if let Some(ref cmd) = args.cmd {
+        run_daemon(cmd, &args.config);
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(&args.log_level)
         .init();
