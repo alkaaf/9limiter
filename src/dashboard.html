@@ -18,6 +18,8 @@
   .top-bar{display:flex;align-items:center;justify-content:space-between;padding:8px 20px;background:#1a1a2e;border-bottom:1px solid #2a2a4a}
   .top-bar .clock{font-size:13px;color:#888;font-family:monospace}
   .top-bar .live-indicator{display:flex;align-items:center;gap:8px;font-size:13px;color:#888}
+  .range-filter select{background:#2a2a4a;color:#e0e0e0;border:1px solid #3a3a5a;border-radius:4px;padding:4px 8px;font-size:12px;cursor:pointer}
+  .range-filter select:focus{outline:none;border-color:#4fc3f7}
   .top-bar .dot{width:8px;height:8px;border-radius:50%;background:#4caf50}
   .top-bar .dot.disconnected{background:#f44336}
   .dashboard{display:flex;flex:1;overflow:hidden}
@@ -73,6 +75,15 @@
       <span id="keys-count">0 keys</span>
       <span id="reqs-count">0 requests</span>
     </div>
+    <div class="range-filter">
+      <select id="range-select">
+        <option value="24h" selected>24 Hours</option>
+        <option value="3d">3 Days</option>
+        <option value="7d">7 Days</option>
+        <option value="15d">15 Days</option>
+        <option value="30d">30 Days</option>
+      </select>
+    </div>
     <div class="live-indicator">
       <span class="dot" id="dot"></span>
       <span id="status-text">connecting&hellip;</span>
@@ -98,7 +109,7 @@
 </div>
 </div>
 <script>
-const MAX_LOG=200;let logCount=0, syncInt=null, clockInt=null, serverTime=null;
+const MAX_LOG=200;let logCount=0, syncInt=null, clockInt=null, serverTime=null, currentRange='24h';
 function shortKey(k){return k.length>12?k.slice(0,12)+'…':k}
 function tickClock(){
   if(serverTime){
@@ -170,6 +181,23 @@ function renderLog(d){
   el.scrollTop=el.scrollHeight;
   while(el.children.length>500)el.removeChild(el.firstChild);
 }
+async function loadRequests(range){
+  currentRange=range;
+  try{
+    const r=await fetch('/api/requests?range='+range);
+    const data=await r.json();
+    const tbody=document.getElementById('log-body');
+    tbody.innerHTML='';logCount=data.length;
+    for(const d of data){
+      const tr=document.createElement('tr');tr.id='log-'+d.id;
+      tr.innerHTML='<td>'+d.timestamp.slice(11,19)+'</td><td title="'+d.api_key+'">'+shortKey(d.api_key)+'</td><td>'+(d.owner||'')+'</td><td>'+d.model+'</td><td><span class="'+(d.status===200?'status-200':d.status===429?'status-429':'status-err')+'">'+d.status+'</span></td><td>'+(d.latency_ms?(d.latency_ms/1000).toFixed(1)+'s':'&mdash;')+'</td>';
+      tbody.appendChild(tr);
+    }
+    document.getElementById('reqs-count').textContent=logCount+' requests';
+  }catch(_){}
+}
+document.getElementById('range-select').addEventListener('change',function(e){loadRequests(e.target.value)});
+loadRequests('24h');
 connect();
 </script>
 </body>

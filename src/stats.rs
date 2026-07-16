@@ -316,7 +316,10 @@ pub async fn requests_handler(
     };
     match RequestLogWriter::query_logs(&state.stats_db_path, &start.to_rfc3339(), &end.to_rfc3339(), 200) {
         Ok(logs) => axum::Json(serde_json::json!(logs)),
-        Err(_) => axum::Json(serde_json::json!([])),
+        Err(e) => {
+            tracing::error!("request_log query error: {}", e);
+            axum::Json(serde_json::json!([]))
+        }
     }
 }
 
