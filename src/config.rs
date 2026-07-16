@@ -39,14 +39,14 @@ pub struct ApiKeyEntry {
 }
 
 impl Config {
-    pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let content = std::fs::read_to_string(path)?;
         let config: Config = serde_yaml::from_str(&content)?;
         config.validate()?;
         Ok(config)
     }
 
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ruleset_names: HashSet<&str> =
             self.rulesets.iter().map(|r| r.name.as_str()).collect();
 
