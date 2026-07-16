@@ -117,12 +117,22 @@ mod tests {
     #[test]
     fn test_sliding_limiter() {
         let limiter = limiter::SlidingLimiter::new();
-
         assert!(limiter.check("key1", "gpt-4", 3, 60).0);
         assert!(limiter.check("key1", "gpt-4", 3, 60).0);
         assert!(limiter.check("key1", "gpt-4", 3, 60).0);
         assert!(!limiter.check("key1", "gpt-4", 3, 60).0);
         assert!(limiter.check("key2", "gpt-4", 3, 60).0);
+    }
+
+    #[test]
+    fn test_rate_limit_blocks() {
+        let limiter = limiter::SlidingLimiter::new();
+        for _ in 0..5 {
+            assert!(limiter.check("k", "m", 5, 60).0);
+        }
+        for _ in 0..10 {
+            assert!(!limiter.check("k", "m", 5, 60).0);
+        }
     }
 
     #[test]
@@ -140,5 +150,66 @@ mod tests {
         assert!(!proxy::rule_matches(&rule, "gpt-4", "Mon", "18:00"));
         assert!(!proxy::rule_matches(&rule, "claude-3", "Mon", "10:00"));
         assert!(!proxy::rule_matches(&rule, "gpt-4", "Mon", "06:59"));
+    }
+
+    #[test]
+    fn test_multiple_rules() {
+        let limiter = limiter::SlidingLimiter::new();
+        // Same (key, model) hit by 2 rules: limit=2 and limit=3
+        let (passed, _) = limiter.check("k", "m", 2, 60);
+        assert!(passed);
+        let (passed, _) = limiter.check("k", "m", 3, 60);
+        assert!(passed);
+        let (passed, _) = limiter.check("k", "m", 2, 60);
+        assert!(passed);
+        let (passed, _) = limiter.check("k", "m", 3, 60);
+        assert!(passed);
+        // 3rd request for limit=2 rule blocked
+        let (passed, _) = limiter.check("k", "m", 2, 60);
+        assert!(!passed);
+    }
+
+    #[test]
+    fn test_overlap_does_not_crash() {
+        let yaml = r#"
+upstreams:
+  - path_prefix: "/v1/chat"
+    base_url: "https://api.openai.com"
+rulesets:
+  - name: test
+    rules:
+      - model: "gpt-4"
+        limit: 100
+        window_secs: 3600
+        time_start: "09:00"
+        time_end: "17:00"
+        days: [Mon, Tue, Wed, Thu, Fri]
+      - model: "gpt-4"
+        limit: 50
+        window_secs: 3600
+        time_start: "12:00"
+        time_end: "14:00"
+        days: [Mon, Wed, Fri]
+api_keys:
+  - ruleset: test
+    keys: ["sk-test"]
+"#;
+        let cfg: config::Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_config_swap() {
+        let cfg = config::Config::from_file("config.yaml").unwrap();
+        let config = Arc::new(tokio::sync::RwLock::new(cfg));
+
+        let before = { config.read().await.listen.clone() };
+        let mut new_cfg = config::Config::from_file("config.yaml").unwrap();
+        new_cfg.listen = Some(":9090".into());
+        *config.write().await = new_cfg;
+        let after = { config.read().await.listen.clone() };
+
+        assert_ne!(before, after);
+        assert_eq!(after, Some(":9090".into()));
     }
 }
