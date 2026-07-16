@@ -117,7 +117,7 @@ impl StatsHandle {
                      0
                  ) + ?4)"
             )?;
-            for (hour, api_key, model, tokens) in batch {
+            for (api_key, model, hour, tokens) in batch {
                 stmt.execute(rusqlite::params![hour, api_key, model, tokens])?;
             }
         }
@@ -193,4 +193,272 @@ pub async fn stats_handler(
 
 pub async fn stats_page_handler() -> impl IntoResponse {
     axum::response::Html(include_str!("stats.html"))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RequestLog {
+    pub id: String,
+    pub api_key: String,
+    pub owner: String,
+    pub model: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub timestamp: String,
+}
+
+pub struct RequestLogWriter;
+
+impl RequestLogWriter {
+    pub fn init_db(path: &str) {
+        let conn = Connection::open(path).expect("failed to open stats db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS request_logs (
+                id         TEXT PRIMARY KEY,
+                api_key    TEXT NOT NULL,
+                owner      TEXT NOT NULL DEFAULT '',
+                model      TEXT NOT NULL,
+                method     TEXT NOT NULL,
+                path       TEXT NOT NULL,
+                status     INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                timestamp  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(timestamp);"
+        ).expect("failed to init request_logs table");
+    }
+
+    pub fn flush_batch(db_path: &str, batch: &[RequestLog]) -> Result<(), rusqlite::Error> {
+        let conn = Connection::open(db_path)?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO request_logs (id, api_key, owner, model, method, path, status, latency_ms, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+            )?;
+            for log in batch {
+                stmt.execute(rusqlite::params![
+                    log.id, log.api_key, log.owner, log.model,
+                    log.method, log.path, log.status, log.latency_ms, log.timestamp
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn query_logs(db_path: &str, start: &str, end: &str, limit: usize) -> Result<Vec<RequestLog>, rusqlite::Error> {
+        let conn = Connection::open(db_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, api_key, owner, model, method, path, status, latency_ms, timestamp
+             FROM request_logs
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY timestamp DESC
+             LIMIT ?3"
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![start, end, limit as i64],
+            |row| {
+                Ok(RequestLog {
+                    id: row.get(0)?,
+                    api_key: row.get(1)?,
+                    owner: row.get(2)?,
+                    model: row.get(3)?,
+                    method: row.get(4)?,
+                    path: row.get(5)?,
+                    status: row.get::<_, i32>(6)? as u16,
+                    latency_ms: row.get::<_, i64>(7)? as u64,
+                    timestamp: row.get(8)?,
+                })
+            }
+        )?;
+        rows.collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn tmp_db() -> (String, StatsHandle) {
+        let uid = uuid::Uuid::new_v4().to_string();
+        let dir = std::env::temp_dir().join(format!("9limiter_stats_test_{}", uid));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_stats.db").to_string_lossy().to_string();
+        StatsCollector::init_db(&path);
+        let handle = StatsHandle {
+            db_path: path.clone(),
+            rx: Arc::new(Mutex::new(tokio::sync::mpsc::unbounded_channel::<(String, String, String, u64)>().1)),
+            key_owners: Arc::new(HashMap::new()),
+        };
+        (path, handle)
+    }
+
+    #[test]
+    fn test_flush_and_query() {
+        let (path, handle) = tmp_db();
+        let mut batch: Vec<(String, String, String, u64)> = Vec::new();
+        batch.push(("sk-key1".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 50));
+        batch.push(("sk-key1".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 30)); // same key+model+hour → merged
+        batch.push(("sk-key1".into(), "claude-3".into(), "2026-07-16T10:00:00+07:00".into(), 100));
+        batch.push(("sk-key2".into(), "gpt-4".into(), "2026-07-16T11:00:00+07:00".into(), 200));
+        StatsHandle::flush_batch(&path, &batch).unwrap();
+
+        // Query all
+        let (models, users) = handle.query("2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00");
+        assert_eq!(models.len(), 2);
+        // gpt-4 = 50+30+200 = 280, claude-3 = 100
+        assert_eq!(models[0].model, "gpt-4");
+        assert_eq!(models[0].tokens, 280);
+        assert_eq!(models[1].model, "claude-3");
+        assert_eq!(models[1].tokens, 100);
+
+        assert_eq!(users.len(), 2);
+        // sk-key2 = 200, sk-key1 = 50+30+100 = 180
+        assert_eq!(users[0].api_key, "sk-key2");
+        assert_eq!(users[0].tokens, 200);
+        assert_eq!(users[1].api_key, "sk-key1");
+        assert_eq!(users[1].tokens, 180);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_query_empty_db() {
+        let (path, handle) = tmp_db();
+        let (models, users) = handle.query("2026-07-01T00:00:00+07:00", "2026-07-02T00:00:00+07:00");
+        assert!(models.is_empty());
+        assert!(users.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_query_partial_range() {
+        let (path, handle) = tmp_db();
+        let mut batch: Vec<(String, String, String, u64)> = Vec::new();
+        batch.push(("sk-key1".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 50));
+        StatsHandle::flush_batch(&path, &batch).unwrap();
+
+        // Query outside range → empty
+        let (models, users) = handle.query("2026-07-17T00:00:00+07:00", "2026-07-18T00:00:00+07:00");
+        assert!(models.is_empty());
+        assert!(users.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cleanup_sql_valid() {
+        // Verify cleanup SQL doesn't crash — just test the SQL is valid
+        let (path, _handle) = tmp_db();
+        StatsHandle::cleanup(&path); // should not panic
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_init_db_idempotent() {
+        let dir = std::env::temp_dir().join(format!("9limiter_stats_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("idempotent.db").to_string_lossy().to_string();
+        // Call twice — second should not fail
+        StatsCollector::init_db(&path);
+        StatsCollector::init_db(&path);
+        let conn = Connection::open(&path).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_key_owner_in_query() {
+        let dir = std::env::temp_dir().join(format!("9limiter_stats_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("owner_test.db").to_string_lossy().to_string();
+        StatsCollector::init_db(&path);
+
+        let mut owners = HashMap::new();
+        owners.insert("sk-key1".to_string(), "Alice".to_string());
+        let owners = Arc::new(owners);
+
+        let handle = StatsHandle {
+            db_path: path.clone(),
+            rx: Arc::new(Mutex::new(tokio::sync::mpsc::unbounded_channel::<(String, String, String, u64)>().1)),
+            key_owners: owners,
+        };
+
+        let batch = vec![("sk-key1".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 50)];
+        StatsHandle::flush_batch(&path, &batch).unwrap();
+
+        let (_, users) = handle.query("2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].owner, "Alice");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_owner_fallback_empty() {
+        let (path, handle) = tmp_db();
+        let batch = vec![("sk-unknown".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 10)];
+        StatsHandle::flush_batch(&path, &batch).unwrap();
+        let (_, users) = handle.query("2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00");
+        assert_eq!(users[0].owner, "");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_request_log_flush_and_query() {
+        let uid = uuid::Uuid::new_v4().to_string();
+        let dir = std::env::temp_dir().join(format!("9limiter_rl_test_{}", uid));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_rl.db").to_string_lossy().to_string();
+
+        RequestLogWriter::init_db(&path);
+
+        let logs = vec![
+            RequestLog { id: "r1".into(), api_key: "sk-key1".into(), owner: "alice".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 500, timestamp: "2026-07-16T10:00:00+07:00".into() },
+            RequestLog { id: "r2".into(), api_key: "sk-key2".into(), owner: "bob".into(), model: "claude-3".into(), method: "POST".into(), path: "/v1/messages".into(), status: 429, latency_ms: 0, timestamp: "2026-07-16T12:00:00+07:00".into() },
+        ];
+        RequestLogWriter::flush_batch(&path, &logs).unwrap();
+
+        let results = RequestLogWriter::query_logs(&path, "2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00", 200).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "r2");
+        assert_eq!(results[1].model, "gpt-4");
+
+        let results = RequestLogWriter::query_logs(&path, "2026-07-16T11:00:00+07:00", "2026-07-16T13:00:00+07:00", 200).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "r2");
+
+        let results = RequestLogWriter::query_logs(&path, "2026-07-17T00:00:00+07:00", "2026-07-18T00:00:00+07:00", 200).unwrap();
+        assert!(results.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_request_log_writer_cleanup() {
+        let uid = uuid::Uuid::new_v4().to_string();
+        let dir = std::env::temp_dir().join(format!("9limiter_rl_test_{}", uid));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_rl.db").to_string_lossy().to_string();
+        RequestLogWriter::init_db(&path);
+
+        let logs = vec![
+            RequestLog { id: "old".into(), api_key: "sk-k".into(), owner: "".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 100, timestamp: "2026-05-01T00:00:00+07:00".into() },
+            RequestLog { id: "new".into(), api_key: "sk-k".into(), owner: "".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 100, timestamp: "2026-07-16T00:00:00+07:00".into() },
+        ];
+        RequestLogWriter::flush_batch(&path, &logs).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM request_logs WHERE timestamp < datetime('now', '-60 days')", []).unwrap();
+
+        let results = RequestLogWriter::query_logs(&path, "2000-01-01", "2099-12-31", 200).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "new");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
