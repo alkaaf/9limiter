@@ -17,8 +17,10 @@ pub struct UserStat {
 }
 
 pub struct StatsCollector {
+    #[allow(dead_code)]
     db_path: String,
     pub sender: tokio::sync::mpsc::UnboundedSender<(String, String, String, u64)>,
+    #[allow(dead_code)]
     key_owners: Arc<HashMap<String, String>>,
 }
 

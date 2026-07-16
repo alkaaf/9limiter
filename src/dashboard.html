@@ -6,12 +6,20 @@
 <title>9limiter &mdash; Dashboard</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f0f1a;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
-  header{background:#1a1a2e;padding:12px 24px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2a2a4a}
-  header h1{font-size:18px;font-weight:600}
-  .live-indicator{display:flex;align-items:center;gap:8px;font-size:13px;color:#666}
-  .live-indicator .dot{width:8px;height:8px;border-radius:50%;background:#4caf50}
-  .live-indicator .dot.disconnected{background:#f44336}
+  body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f0f1a;color:#e0e0e0;height:100vh;display:flex}
+  .sidebar{width:200px;background:#1a1a2e;border-right:1px solid #2a2a4a;display:flex;flex-direction:column;flex-shrink:0}
+  .sidebar h1{font-size:16px;font-weight:600;padding:16px 20px;border-bottom:1px solid #2a2a4a}
+  .sidebar .links{display:flex;flex-direction:column;padding:8px 0}
+  .sidebar .links a{padding:10px 20px;font-size:13px;color:#888;text-decoration:none;transition:background .15s,color .15s}
+  .sidebar .links a:hover{background:#2a2a4a;color:#e0e0e0}
+  .sidebar .links a.active{color:#e0e0e0;background:#2a2a4a;border-left:3px solid #4fc3f7}
+  .sidebar .bottom{margin-top:auto;padding:12px 16px;font-size:11px;color:#555;font-family:monospace;border-top:1px solid #2a2a4a}
+  .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+  .top-bar{display:flex;align-items:center;justify-content:space-between;padding:8px 20px;background:#1a1a2e;border-bottom:1px solid #2a2a4a}
+  .top-bar .clock{font-size:13px;color:#888;font-family:monospace}
+  .top-bar .live-indicator{display:flex;align-items:center;gap:8px;font-size:13px;color:#888}
+  .top-bar .dot{width:8px;height:8px;border-radius:50%;background:#4caf50}
+  .top-bar .dot.disconnected{background:#f44336}
   .dashboard{display:flex;flex:1;overflow:hidden}
   .panel{flex:1;display:flex;flex-direction:column;overflow:hidden}
   .panel-left{border-right:1px solid #2a2a4a}
@@ -36,7 +44,6 @@
   .status-200{color:#4caf50}
   .status-429{color:#f44336}
   .status-err{color:#ff9800}
-  td .key-trunc{max-width:80px;overflow:hidden;text-overflow:ellipsis;display:inline-block;white-space:nowrap;vertical-align:middle}
   .rate-info{font-size:12px;color:#888;display:flex;gap:16px;padding:8px 16px;border-bottom:1px solid #2a2a4a}
   .log-bar{background:#0a0a14;border-top:1px solid #2a2a4a;height:160px;display:flex;flex-direction:column}
   .log-bar h2{font-size:11px;text-transform:uppercase;color:#666;padding:4px 12px;letter-spacing:.5px;border-bottom:1px solid #1a1a2a}
@@ -46,39 +53,49 @@
   .log-line .lvl-info{color:#4caf50}
   .log-line .lvl-warn{color:#ff9800}
   .log-line .lvl-error{color:#f44336}
-  @media(max-width:768px){.dashboard{flex-direction:column}}
+  @media(max-width:768px){.sidebar{width:160px}}
 </style>
 </head>
 <body>
-<header>
+<div class="sidebar">
   <h1>9limiter</h1>
-  <div style="font-size:13px;color:#888;font-family:monospace" id="clock"></div>
-  <div class="live-indicator">
-    <span class="dot" id="dot"></span>
-    <span id="status-text">connecting&hellip;</span>
+  <div class="links">
+    <a href="/dashboard" class="active">Dashboard</a>
+    <a href="/stats">Stats</a>
   </div>
-</header>
-<div class="rate-info">
-  <span id="keys-count">0 keys</span>
-  <span id="reqs-count">0 requests</span>
+  <div class="bottom">
+    <span id="clock">--:--:--</span>
+  </div>
 </div>
-<div class="dashboard">
-  <div class="panel panel-left">
-    <h2>Rate Limit Status</h2>
-    <div class="scroll" id="rate-cards"></div>
-  </div>
-  <div class="panel panel-right">
-    <h2>Live Requests</h2>
-    <div class="scroll" id="log-table">
-      <table><thead><tr>
-        <th>Time</th><th>Key</th><th>Owner</th><th>Model</th><th>Status</th><th>Latency</th>
-      </tr></thead><tbody id="log-body"></tbody></table>
+<div class="main">
+  <div class="top-bar">
+    <div class="rate-info" style="border:none;padding:0">
+      <span id="keys-count">0 keys</span>
+      <span id="reqs-count">0 requests</span>
+    </div>
+    <div class="live-indicator">
+      <span class="dot" id="dot"></span>
+      <span id="status-text">connecting&hellip;</span>
     </div>
   </div>
-</div>
+  <div class="dashboard">
+    <div class="panel panel-left">
+      <h2>Rate Limit Status</h2>
+      <div class="scroll" id="rate-cards"></div>
+    </div>
+    <div class="panel panel-right">
+      <h2>Live Requests</h2>
+      <div class="scroll" id="log-table">
+        <table><thead><tr>
+          <th>Time</th><th>Key</th><th>Owner</th><th>Model</th><th>Status</th><th>Latency</th>
+        </tr></thead><tbody id="log-body"></tbody></table>
+      </div>
+    </div>
+  </div>
 <div class="log-bar">
   <h2>Logs</h2>
   <div class="log-scroll" id="log-output"></div>
+</div>
 </div>
 <script>
 const MAX_LOG=200;let logCount=0, syncInt=null, clockInt=null, serverTime=null;
