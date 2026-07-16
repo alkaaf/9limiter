@@ -1,0 +1,21 @@
+[package]
+name = "ninelimiter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+axum-extra = "0.10"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "set-header"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive"] }
+notify = { version = "7", features = ["macos_kqueue"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
