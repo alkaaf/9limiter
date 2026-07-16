@@ -1,4 +1,5 @@
 pub mod config;
+mod limiter;
 
 use clap::Parser;
 
@@ -26,10 +27,27 @@ async fn main() {
     tracing::info!("shutdown complete");
 }
 
-#[test]
-fn test_parse_config() {
-    let cfg = config::Config::from_file("config.yaml").unwrap();
-    assert_eq!(cfg.rulesets.len(), 2);
-    assert_eq!(cfg.api_keys.len(), 1);
-    assert_eq!(cfg.api_keys[0].keys.len(), 2);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_config() {
+        let cfg = config::Config::from_file("config.yaml").unwrap();
+        assert_eq!(cfg.rulesets.len(), 2);
+        assert_eq!(cfg.api_keys.len(), 1);
+        assert_eq!(cfg.api_keys[0].keys.len(), 2);
+    }
+
+    #[test]
+    fn test_sliding_limiter() {
+        let limiter = limiter::SlidingLimiter::new();
+
+        assert!(limiter.check("key1", "gpt-4", 3, 60).0);
+        assert!(limiter.check("key1", "gpt-4", 3, 60).0);
+        assert!(limiter.check("key1", "gpt-4", 3, 60).0);
+        assert!(!limiter.check("key1", "gpt-4", 3, 60).0);
+
+        assert!(limiter.check("key2", "gpt-4", 3, 60).0);
+    }
 }
