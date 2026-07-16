@@ -2,8 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RateLimitEvent {
     pub api_key: String,
     pub model: String,

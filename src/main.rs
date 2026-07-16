@@ -1,5 +1,6 @@
 pub mod config;
 mod limiter;
+mod events;
 
 use clap::Parser;
 
