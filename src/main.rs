@@ -2,6 +2,7 @@ pub mod config;
 mod limiter;
 mod events;
 mod proxy;
+mod dashboard;
 
 use clap::Parser;
 
