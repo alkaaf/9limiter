@@ -1,3 +1,5 @@
+pub mod config;
+
 use clap::Parser;
 
 #[derive(Parser)]
@@ -22,4 +24,12 @@ async fn main() {
 
     tokio::signal::ctrl_c().await.unwrap();
     tracing::info!("shutdown complete");
+}
+
+#[test]
+fn test_parse_config() {
+    let cfg = config::Config::from_file("config.yaml").unwrap();
+    assert_eq!(cfg.rulesets.len(), 2);
+    assert_eq!(cfg.api_keys.len(), 1);
+    assert_eq!(cfg.api_keys[0].keys.len(), 2);
 }
