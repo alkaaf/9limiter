@@ -36,6 +36,7 @@ async fn main() {
         config: config.clone(),
         limiter,
         event_tx: event_tx.clone(),
+        upstream_idx: Default::default(),
     };
 
     // Start hot-reload watcher
@@ -56,7 +57,9 @@ async fn main() {
     };
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
-    tracing::info!("listening on {}", listen_addr);
+    tracing::info!("proxy ready on {}", listen_addr);
+    let upstream_count = config.read().await.upstreams.len();
+    tracing::info!("upstreams configured: {}", upstream_count);
     axum::serve(listener, app).await.unwrap();
 }
 

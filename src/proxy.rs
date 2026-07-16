@@ -4,7 +4,8 @@ use axum::{
     http::{header, Request, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use crate::{
     config::Config,
     events::{AppEvent, RequestStartEvent, RequestEndEvent},
@@ -16,6 +17,7 @@ pub struct AppState {
     pub config: Arc<tokio::sync::RwLock<Config>>,
     pub limiter: SlidingLimiter,
     pub event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+    pub upstream_idx: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 pub async fn proxy_handler(
@@ -74,22 +76,32 @@ pub async fn proxy_handler(
         }
     }
 
-    // Phase 2: upstream selection
+    // Phase 2: upstream selection (round-robin per prefix group)
     let upstream_url = {
         let config = state.config.read().await;
-        let upstream = config.upstreams.iter()
-            .filter(|u| parts.uri.path().starts_with(&u.path_prefix))
-            .max_by_key(|u| u.path_prefix.len());
+        let candidates: Vec<_> = config.upstreams.iter()
+            .enumerate()
+            .filter(|(_, u)| parts.uri.path().starts_with(&u.path_prefix))
+            .collect();
 
-        let upstream = match upstream {
-            Some(u) => u,
-            None => return (StatusCode::NOT_FOUND, "no matching upstream").into_response(),
+        let upstream = match candidates.as_slice() {
+            [] => return (StatusCode::NOT_FOUND, "no matching upstream").into_response(),
+            [(_, u)] => u,                                // single upstream, no rr needed
+            multiple => {
+                let prefix = &multiple[0].1.path_prefix;
+                let mut idx_map = state.upstream_idx.lock().unwrap();
+                let next = idx_map.entry(prefix.clone()).or_insert(0);
+                let chosen = &multiple[*next % multiple.len()];
+                *next = (*next + 1) % multiple.len();
+                &chosen.1
+            }
         };
 
         let path = parts.uri.path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("");
-        format!("{}{}", upstream.base_url.trim_end_matches('/'), path)
+        let suffix = path.strip_prefix(upstream.path_prefix.as_str()).unwrap_or(path);
+        format!("{}{}", upstream.base_url.trim_end_matches('/'), suffix)
     };
 
     proxy_to_upstream(&state, parts, bytes, &upstream_url, &api_key, &model).await

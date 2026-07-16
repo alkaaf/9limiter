@@ -6,7 +6,6 @@ use axum::{
     response::{Html, IntoResponse},
 };
 use futures_util::{SinkExt, StreamExt};
-use crate::events::AppEvent;
 use crate::proxy::AppState;
 
 pub async fn dashboard_handler() -> impl IntoResponse {

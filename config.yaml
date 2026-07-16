@@ -1,10 +1,8 @@
-listen: ":8080"
+listen: ":20127"
 
 upstreams:
-  - path_prefix: "/v1/chat/completions"
-    base_url: "https://api.openai.com"
-  - path_prefix: "/v1/messages"
-    base_url: "https://api.anthropic.com"
+  - path_prefix: "/v1"
+    base_url: "http://localhost:20128/v1"
 
 fallback_ruleset: default
 
