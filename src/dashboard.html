@@ -98,7 +98,7 @@
       <h2>Live Requests</h2>
       <div class="scroll" id="log-table">
         <table><thead><tr>
-          <th>Time</th><th>Key</th><th>Owner</th><th>Model</th><th>Status</th><th>Latency</th>
+          <th>Time</th><th>Key</th><th>Owner</th><th>Model</th><th>Status</th><th>Latency</th><th>In</th><th>Out</th><th>Cache</th>
         </tr></thead><tbody id="log-body"></tbody></table>
       </div>
     </div>
@@ -160,7 +160,7 @@ function renderCard(d){
 function renderRow(d){
   const t=document.getElementById('log-body');
   const r=document.createElement('tr');r.id='log-'+d.id;r.className='in-flight';
-  r.innerHTML='<td>'+new Date().toLocaleTimeString()+'</td><td title="'+d.api_key+'">'+shortKey(d.api_key)+'</td><td>'+(d.owner||'')+'</td><td>'+d.model+'</td><td><span class="status-err">&hellip;</span></td><td>&mdash;</td>';
+  r.innerHTML='<td>'+new Date().toLocaleTimeString()+'</td><td title="'+d.api_key+'">'+shortKey(d.api_key)+'</td><td>'+(d.owner||'')+'</td><td>'+d.model+'</td><td><span class="status-err">&hellip;</span></td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td>';
   t.prepend(r);logCount++;
   while(t.children.length>MAX_LOG)t.removeChild(t.lastChild);
   document.getElementById('reqs-count').textContent=Math.min(logCount,MAX_LOG)+' requests';
@@ -170,7 +170,10 @@ function updateRow(d){
   r.className='';
   const sc=d.status===200?'status-200':d.status===429?'status-429':'status-err';
   r.querySelector('td:nth-child(5)').innerHTML='<span class="'+sc+'">'+d.status+'</span>';
-  r.querySelector('td:nth-child(6)').textContent=d.latency_ms?(d.latency_ms/1000).toFixed(1)+'s':'&mdash;'
+  r.querySelector('td:nth-child(6)').textContent=d.latency_ms?(d.latency_ms/1000).toFixed(1)+'s':'&mdash;';
+  r.querySelector('td:nth-child(7)').textContent=d.input_tokens!==undefined&&d.input_tokens!==null?d.input_tokens:'&mdash;';
+  r.querySelector('td:nth-child(8)').textContent=d.output_tokens!==undefined&&d.output_tokens!==null?d.output_tokens:'&mdash;';
+  r.querySelector('td:nth-child(9)').textContent=d.cache_tokens!==undefined&&d.cache_tokens!==null?d.cache_tokens:'&mdash;';
 }
 function renderLog(d){
   const el=document.getElementById('log-output');
@@ -190,7 +193,7 @@ async function loadRequests(range){
     tbody.innerHTML='';logCount=data.length;
     for(const d of data){
       const tr=document.createElement('tr');tr.id='log-'+d.id;
-      tr.innerHTML='<td>'+d.timestamp.slice(11,19)+'</td><td title="'+d.api_key+'">'+shortKey(d.api_key)+'</td><td>'+(d.owner||'')+'</td><td>'+d.model+'</td><td><span class="'+(d.status===200?'status-200':d.status===429?'status-429':'status-err')+'">'+d.status+'</span></td><td>'+(d.latency_ms?(d.latency_ms/1000).toFixed(1)+'s':'&mdash;')+'</td>';
+      tr.innerHTML='<td>'+d.timestamp.slice(11,19)+'</td><td title="'+d.api_key+'">'+shortKey(d.api_key)+'</td><td>'+(d.owner||'')+'</td><td>'+d.model+'</td><td><span class="'+(d.status===200?'status-200':d.status===429?'status-429':'status-err')+'">'+d.status+'</span></td><td>'+(d.latency_ms?(d.latency_ms/1000).toFixed(1)+'s':'&mdash;')+'</td><td>'+(d.input_tokens!==undefined&&d.input_tokens!==null?d.input_tokens:'')+'</td><td>'+(d.output_tokens!==undefined&&d.output_tokens!==null?d.output_tokens:'')+'</td><td>'+(d.cache_tokens!==undefined&&d.cache_tokens!==null?d.cache_tokens:'')+'</td>';
       tbody.appendChild(tr);
     }
     document.getElementById('reqs-count').textContent=logCount+' requests';

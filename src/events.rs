@@ -17,6 +17,9 @@ pub struct RequestEndEvent {
     pub id: String,
     pub status: u16,
     pub latency_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

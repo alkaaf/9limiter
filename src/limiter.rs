@@ -121,3 +121,131 @@ impl SlidingLimiter {
         events
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Barrier;
+
+    #[test]
+    fn test_serial_hit_limit() {
+        let limiter = SlidingLimiter::new();
+        assert!(limiter.check("k1", "gpt-4", 3, 60).0);
+        assert!(limiter.check("k1", "gpt-4", 3, 60).0);
+        assert!(limiter.check("k1", "gpt-4", 3, 60).0);
+        assert!(!limiter.check("k1", "gpt-4", 3, 60).0);
+    }
+
+    #[test]
+    fn test_parallel_exceeds_limit() {
+        let limiter = Arc::new(SlidingLimiter::new());
+        let threads: usize = 8;
+        let limit: u32 = 3;
+        let window: u64 = 30;
+
+        let barrier = Arc::new(Barrier::new(threads));
+        let passed = Arc::new(AtomicU32::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let l = limiter.clone();
+            let b = barrier.clone();
+            let p = passed.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                if l.check("k-par", "gpt-4", limit, window).0 {
+                    p.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+
+        let count = passed.load(Ordering::Relaxed);
+        assert_eq!(count, limit, "only {} should pass limit={}, got {}", limit, limit, count);
+    }
+
+    #[test]
+    fn test_parallel_under_limit() {
+        let limiter = Arc::new(SlidingLimiter::new());
+        let threads: usize = 5;
+        let limit: u32 = 10;
+        let window: u64 = 30;
+
+        let barrier = Arc::new(Barrier::new(threads));
+        let passed = Arc::new(AtomicU32::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let l = limiter.clone();
+            let b = barrier.clone();
+            let p = passed.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                if l.check("k-under", "gpt-4", limit, window).0 {
+                    p.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+
+        let count = passed.load(Ordering::Relaxed);
+        assert_eq!(count, threads as u32, "all {} should pass limit={}", threads, limit);
+    }
+
+    #[test]
+    fn test_parallel_isolation_multiple_keys() {
+        let limiter = Arc::new(SlidingLimiter::new());
+        let per_key_limit: u32 = 2;
+        let window: u64 = 30;
+
+        let keys = ["key-a", "key-b", "key-c"];
+        let barrier = Arc::new(Barrier::new(keys.len() * 4));
+        let results = Arc::new(Mutex::new(HashMap::<&str, u32>::new()));
+
+        let mut handles = Vec::new();
+        for &key in &keys {
+            for _ in 0..4 {
+                let l = limiter.clone();
+                let b = barrier.clone();
+                let r = results.clone();
+                let k = key;
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    let passed = l.check(k, "gpt-4", per_key_limit, window).0;
+                    if passed {
+                        let mut map = r.lock().unwrap();
+                        *map.entry(k).or_insert(0) += 1;
+                    }
+                }));
+            }
+        }
+        for h in handles { h.join().unwrap(); }
+
+        let map = results.lock().unwrap();
+        for &key in &keys {
+            assert_eq!(*map.get(key).unwrap_or(&0), per_key_limit,
+                "key {} should pass exactly {} times", key, per_key_limit);
+        }
+    }
+
+    #[test]
+    fn test_serial_event_counts() {
+        let limiter = SlidingLimiter::new();
+        let (p, e) = limiter.check("k", "m", 5, 60);
+        assert!(p); assert_eq!(e.count, 0); assert_eq!(e.remaining, 5);
+
+        let (p, e) = limiter.check("k", "m", 5, 60);
+        assert!(p); assert_eq!(e.count, 1); assert_eq!(e.remaining, 4);
+
+        let (p, e) = limiter.check("k", "m", 5, 60);
+        assert!(p); assert_eq!(e.count, 2); assert_eq!(e.remaining, 3);
+
+        let (p, _) = limiter.check("k", "m", 5, 60);
+        assert!(p);
+        let (p, _) = limiter.check("k", "m", 5, 60);
+        assert!(p);
+        let (p, e) = limiter.check("k", "m", 5, 60);
+        assert!(!p); assert_eq!(e.count, 5); assert_eq!(e.remaining, 0);
+    }
+}

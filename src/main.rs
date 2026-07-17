@@ -238,6 +238,9 @@ async fn main() {
     stats::RequestLogWriter::init_db(&stats_db);
     stats::spawn_request_log_writer(stats_db.clone(), rl_rx);
 
+    let http_client = reqwest::Client::new();
+    let circuit_breaker = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
     let state = proxy::AppState {
         config: config.clone(),
         limiter,
@@ -249,6 +252,8 @@ async fn main() {
         stats_handle: stats_handle.clone(),
         request_log_tx: rl_tx.clone(),
         stats_db_path: stats_db.clone(),
+        http_client,
+        circuit_breaker,
     };
 
     // Start hot-reload watcher

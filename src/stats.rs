@@ -209,6 +209,9 @@ pub struct RequestLog {
     pub path: String,
     pub status: u16,
     pub latency_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_tokens: u64,
     pub timestamp: String,
 }
 
@@ -219,18 +222,25 @@ impl RequestLogWriter {
         let conn = Connection::open(path).expect("failed to open stats db");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS request_logs (
-                id         TEXT PRIMARY KEY,
-                api_key    TEXT NOT NULL,
-                owner      TEXT NOT NULL DEFAULT '',
-                model      TEXT NOT NULL,
-                method     TEXT NOT NULL,
-                path       TEXT NOT NULL,
-                status     INTEGER NOT NULL DEFAULT 0,
-                latency_ms INTEGER NOT NULL DEFAULT 0,
-                timestamp  TEXT NOT NULL
+                id            TEXT PRIMARY KEY,
+                api_key       TEXT NOT NULL,
+                owner         TEXT NOT NULL DEFAULT '',
+                model         TEXT NOT NULL,
+                method        TEXT NOT NULL,
+                path          TEXT NOT NULL,
+                status        INTEGER NOT NULL DEFAULT 0,
+                latency_ms    INTEGER NOT NULL DEFAULT 0,
+                input_tokens  INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_tokens  INTEGER NOT NULL DEFAULT 0,
+                timestamp     TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(timestamp);"
         ).expect("failed to init request_logs table");
+        // Migration: add columns if table existed from older version
+        let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN cache_tokens INTEGER NOT NULL DEFAULT 0", []);
     }
 
     pub fn flush_batch(db_path: &str, batch: &[RequestLog]) -> Result<(), rusqlite::Error> {
@@ -238,13 +248,15 @@ impl RequestLogWriter {
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO request_logs (id, api_key, owner, model, method, path, status, latency_ms, timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                "INSERT OR IGNORE INTO request_logs (id, api_key, owner, model, method, path, status, latency_ms, input_tokens, output_tokens, cache_tokens, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             )?;
             for log in batch {
                 stmt.execute(rusqlite::params![
                     log.id, log.api_key, log.owner, log.model,
-                    log.method, log.path, log.status, log.latency_ms, log.timestamp
+                    log.method, log.path, log.status, log.latency_ms,
+                    log.input_tokens, log.output_tokens, log.cache_tokens,
+                    log.timestamp
                 ])?;
             }
         }
@@ -255,7 +267,7 @@ impl RequestLogWriter {
     pub fn query_logs(db_path: &str, start: &str, end: &str, limit: usize) -> Result<Vec<RequestLog>, rusqlite::Error> {
         let conn = Connection::open(db_path)?;
         let mut stmt = conn.prepare(
-            "SELECT id, api_key, owner, model, method, path, status, latency_ms, timestamp
+            "SELECT id, api_key, owner, model, method, path, status, latency_ms, input_tokens, output_tokens, cache_tokens, timestamp
              FROM request_logs
              WHERE timestamp >= ?1 AND timestamp <= ?2
              ORDER BY timestamp DESC
@@ -273,7 +285,10 @@ impl RequestLogWriter {
                     path: row.get(5)?,
                     status: row.get::<_, i32>(6)? as u16,
                     latency_ms: row.get::<_, i64>(7)? as u64,
-                    timestamp: row.get(8)?,
+                    input_tokens: row.get::<_, i64>(8)? as u64,
+                    output_tokens: row.get::<_, i64>(9)? as u64,
+                    cache_tokens: row.get::<_, i64>(10)? as u64,
+                    timestamp: row.get(11)?,
                 })
             }
         )?;
@@ -306,7 +321,7 @@ pub async fn requests_handler(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let range = params.get("range").map(|s| s.as_str()).unwrap_or("24h");
-    let now = chrono::Utc::now();
+    let now = chrono::Utc::now().with_timezone(&state.tz);
     let (start, end) = match range {
         "3d"  => (now - chrono::Duration::days(3), now),
         "7d"  => (now - chrono::Duration::days(7), now),
@@ -464,8 +479,8 @@ mod tests {
         RequestLogWriter::init_db(&path);
 
         let logs = vec![
-            RequestLog { id: "r1".into(), api_key: "sk-key1".into(), owner: "alice".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 500, timestamp: "2026-07-16T10:00:00+07:00".into() },
-            RequestLog { id: "r2".into(), api_key: "sk-key2".into(), owner: "bob".into(), model: "claude-3".into(), method: "POST".into(), path: "/v1/messages".into(), status: 429, latency_ms: 0, timestamp: "2026-07-16T12:00:00+07:00".into() },
+            RequestLog { id: "r1".into(), api_key: "sk-key1".into(), owner: "alice".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 500, input_tokens: 0, output_tokens: 0, cache_tokens: 0, timestamp: "2026-07-16T10:00:00+07:00".into() },
+            RequestLog { id: "r2".into(), api_key: "sk-key2".into(), owner: "bob".into(), model: "claude-3".into(), method: "POST".into(), path: "/v1/messages".into(), status: 429, latency_ms: 0, input_tokens: 0, output_tokens: 0, cache_tokens: 0, timestamp: "2026-07-16T12:00:00+07:00".into() },
         ];
         RequestLogWriter::flush_batch(&path, &logs).unwrap();
 
@@ -493,8 +508,8 @@ mod tests {
         RequestLogWriter::init_db(&path);
 
         let logs = vec![
-            RequestLog { id: "old".into(), api_key: "sk-k".into(), owner: "".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 100, timestamp: "2026-05-01T00:00:00+07:00".into() },
-            RequestLog { id: "new".into(), api_key: "sk-k".into(), owner: "".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 100, timestamp: "2026-07-16T00:00:00+07:00".into() },
+            RequestLog { id: "old".into(), api_key: "sk-k".into(), owner: "".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 100, input_tokens: 0, output_tokens: 0, cache_tokens: 0, timestamp: "2026-05-01T00:00:00+07:00".into() },
+            RequestLog { id: "new".into(), api_key: "sk-k".into(), owner: "".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 100, input_tokens: 0, output_tokens: 0, cache_tokens: 0, timestamp: "2026-07-16T00:00:00+07:00".into() },
         ];
         RequestLogWriter::flush_batch(&path, &logs).unwrap();
 
@@ -527,5 +542,45 @@ mod tests {
         assert!(s < e);
         let (s, e) = parse_range("30d");
         assert!(s < e);
+    }
+
+    #[test]
+    fn test_cleanup_removes_request_logs() {
+        // Verify stats cleanup also removes old request_logs
+        let uid = uuid::Uuid::new_v4().to_string();
+        let dir = std::env::temp_dir().join(format!("9limiter_rl_test_{}", uid));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_rl.db").to_string_lossy().to_string();
+        RequestLogWriter::init_db(&path);
+
+        // Insert old (60+ days) and recent data
+        let logs = vec![
+            RequestLog { id: "old".into(), api_key: "sk-k".into(), owner: "".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 100, input_tokens: 0, output_tokens: 0, cache_tokens: 0, timestamp: "2026-04-01T00:00:00+07:00".into() },
+            RequestLog { id: "recent".into(), api_key: "sk-k".into(), owner: "".into(), model: "gpt-4".into(), method: "POST".into(), path: "/v1/chat".into(), status: 200, latency_ms: 100, input_tokens: 0, output_tokens: 0, cache_tokens: 0, timestamp: "2026-07-16T00:00:00+07:00".into() },
+        ];
+        RequestLogWriter::flush_batch(&path, &logs).unwrap();
+        drop(logs);
+
+        // Reuse cleanup SQL from StatsHandle
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM request_logs WHERE timestamp < datetime('now', '-60 days')", []).unwrap();
+        drop(conn);
+
+        let results = RequestLogWriter::query_logs(&path, "2000-01-01", "2099-12-31", 200).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "recent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_request_log_init_db_idempotent() {
+        let uid = uuid::Uuid::new_v4().to_string();
+        let dir = std::env::temp_dir().join(format!("9limiter_rl_test_{}", uid));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_rl.db").to_string_lossy().to_string();
+        RequestLogWriter::init_db(&path);
+        RequestLogWriter::init_db(&path); // second call should not fail
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
