@@ -195,7 +195,7 @@ fn send_log(tx: &tokio::sync::broadcast::Sender<AppEvent>, level: &str, msg: Str
 fn extract_usage(body: &[u8]) -> Option<(u64, u64, u64)> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     // OpenAI: usage.total_tokens
-    if let Some(total) = v.get("usage")?.get("total_tokens").and_then(|x| x.as_u64()) {
+    if let Some(_total) = v.get("usage")?.get("total_tokens").and_then(|x| x.as_u64()) {
         let inp = v.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|x| x.as_u64()).unwrap_or(0);
         let out = v.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|x| x.as_u64()).unwrap_or(0);
         let cached = v.get("usage").and_then(|u| u.get("prompt_tokens_details")).and_then(|d| d.get("cached_tokens")).and_then(|x| x.as_u64()).unwrap_or(0);
