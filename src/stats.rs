@@ -65,6 +65,7 @@ impl StatsCollector {
     }
 }
 
+#[derive(Clone)]
 pub struct StatsHandle {
     db_path: String,
     rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(String, String, String, u64)>>>,
@@ -93,14 +94,18 @@ impl StatsHandle {
                 }
 
                 if !batch.is_empty() {
-                    if let Err(e) = Self::flush_batch(&db_path, &batch) {
-                        tracing::error!("stats flush error: {}", e);
-                    }
+                    let db = db_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = Self::flush_batch(&db, &batch) {
+                            tracing::error!("stats flush error: {}", e);
+                        }
+                    }).await.ok();
                 }
 
                 // Hourly cleanup
                 if last_cleanup.elapsed().as_secs() >= 3600 {
-                    Self::cleanup(&db_path);
+                    let db = db_path.clone();
+                    tokio::task::spawn_blocking(move || Self::cleanup(&db)).await.ok();
                     last_cleanup = std::time::Instant::now();
                 }
             }
@@ -147,8 +152,18 @@ impl StatsHandle {
         );
     }
 
-    pub fn query(&self, start: &str, end: &str) -> (Vec<ModelStat>, Vec<UserStat>) {
-        let conn = match Connection::open(&self.db_path) {
+    pub async fn query(&self, start: &str, end: &str) -> (Vec<ModelStat>, Vec<UserStat>) {
+        let db_path = self.db_path.clone();
+        let owners = self.key_owners.clone();
+        let start = start.to_string();
+        let end = end.to_string();
+        tokio::task::spawn_blocking(move || {
+            Self::query_sync(&db_path, &owners, &start, &end)
+        }).await.unwrap_or_default()
+    }
+
+    fn query_sync(db_path: &str, key_owners: &HashMap<String, String>, start: &str, end: &str) -> (Vec<ModelStat>, Vec<UserStat>) {
+        let conn = match Connection::open(db_path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("stats query open error: {}", e);
@@ -178,7 +193,7 @@ impl StatsHandle {
         let users: Vec<UserStat> = stmt.query_map(rusqlite::params![start, end], |row| {
             let api_key: String = row.get(0)?;
             let tokens: i64 = row.get(1)?;
-            let owner = self.key_owners.get(&api_key).cloned().unwrap_or_default();
+            let owner = key_owners.get(&api_key).cloned().unwrap_or_default();
             Ok(UserStat { api_key, owner, tokens: tokens as u64 })
         }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -192,7 +207,7 @@ pub async fn stats_handler(
 ) -> impl IntoResponse {
     let start = params.get("start").cloned().unwrap_or_default();
     let end = params.get("end").cloned().unwrap_or_default();
-    let (models, users) = state.stats_handle.query(&start, &end);
+    let (models, users) = state.stats_handle.query(&start, &end).await;
     axum::Json(serde_json::json!({ "models": models, "users": users }))
 }
 
@@ -310,9 +325,12 @@ pub fn spawn_request_log_writer(db_path: String, rx: Arc<Mutex<tokio::sync::mpsc
                 }
             }
             if !batch.is_empty() {
-                if let Err(e) = RequestLogWriter::flush_batch(&db_path, &batch) {
-                    tracing::error!("request_log flush error: {}", e);
-                }
+                let db = db_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = RequestLogWriter::flush_batch(&db, &batch) {
+                        tracing::error!("request_log flush error: {}", e);
+                    }
+                }).await.ok();
             }
         }
     });
@@ -331,7 +349,13 @@ pub async fn requests_handler(
         "30d" => (now - chrono::Duration::days(30), now),
         _     => (now - chrono::Duration::hours(24), now),
     };
-    match RequestLogWriter::query_logs(&state.stats_db_path, &start.to_rfc3339(), &end.to_rfc3339(), 200) {
+    let db_path = state.stats_db_path.clone();
+    let start_str = start.to_rfc3339();
+    let end_str = end.to_rfc3339();
+    let logs = tokio::task::spawn_blocking(move || {
+        RequestLogWriter::query_logs(&db_path, &start_str, &end_str, 200)
+    }).await.unwrap_or_else(|_| Ok(vec![]));
+    match logs {
         Ok(logs) => axum::Json(serde_json::json!(logs)),
         Err(e) => {
             tracing::error!("request_log query error: {}", e);
@@ -359,8 +383,8 @@ mod tests {
         (path, handle)
     }
 
-    #[test]
-    fn test_flush_and_query() {
+    #[tokio::test]
+    async fn test_flush_and_query() {
         let (path, handle) = tmp_db();
         let mut batch: Vec<(String, String, String, u64)> = Vec::new();
         batch.push(("sk-key1".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 50));
@@ -370,7 +394,7 @@ mod tests {
         StatsHandle::flush_batch(&path, &batch).unwrap();
 
         // Query all
-        let (models, users) = handle.query("2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00");
+        let (models, users) = handle.query("2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00").await;
         assert_eq!(models.len(), 2);
         // gpt-4 = 50+30+200 = 280, claude-3 = 100
         assert_eq!(models[0].model, "gpt-4");
@@ -389,24 +413,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn test_query_empty_db() {
+    #[tokio::test]
+    async fn test_query_empty_db() {
         let (path, handle) = tmp_db();
-        let (models, users) = handle.query("2026-07-01T00:00:00+07:00", "2026-07-02T00:00:00+07:00");
+        let (models, users) = handle.query("2026-07-01T00:00:00+07:00", "2026-07-02T00:00:00+07:00").await;
         assert!(models.is_empty());
         assert!(users.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn test_query_partial_range() {
+    #[tokio::test]
+    async fn test_query_partial_range() {
         let (path, handle) = tmp_db();
         let mut batch: Vec<(String, String, String, u64)> = Vec::new();
         batch.push(("sk-key1".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 50));
         StatsHandle::flush_batch(&path, &batch).unwrap();
 
         // Query outside range → empty
-        let (models, users) = handle.query("2026-07-17T00:00:00+07:00", "2026-07-18T00:00:00+07:00");
+        let (models, users) = handle.query("2026-07-17T00:00:00+07:00", "2026-07-18T00:00:00+07:00").await;
         assert!(models.is_empty());
         assert!(users.is_empty());
         let _ = std::fs::remove_file(&path);
@@ -434,8 +458,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn test_key_owner_in_query() {
+    #[tokio::test]
+    async fn test_key_owner_in_query() {
         let dir = std::env::temp_dir().join(format!("9limiter_stats_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("owner_test.db").to_string_lossy().to_string();
@@ -454,19 +478,19 @@ mod tests {
         let batch = vec![("sk-key1".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 50)];
         StatsHandle::flush_batch(&path, &batch).unwrap();
 
-        let (_, users) = handle.query("2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00");
+        let (_, users) = handle.query("2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00").await;
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].owner, "Alice");
 
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn test_owner_fallback_empty() {
+    #[tokio::test]
+    async fn test_owner_fallback_empty() {
         let (path, handle) = tmp_db();
         let batch = vec![("sk-unknown".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 10)];
         StatsHandle::flush_batch(&path, &batch).unwrap();
-        let (_, users) = handle.query("2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00");
+        let (_, users) = handle.query("2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00").await;
         assert_eq!(users[0].owner, "");
         let _ = std::fs::remove_file(&path);
     }
