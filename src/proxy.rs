@@ -21,9 +21,9 @@ pub struct AppState {
     pub upstream_idx: Arc<Mutex<HashMap<String, usize>>>,
     pub key_owners: Arc<HashMap<String, String>>,
     pub tz: chrono::FixedOffset,
-    pub stats_tx: tokio::sync::mpsc::UnboundedSender<(String, String, String, u64)>,
+    pub stats_tx: tokio::sync::mpsc::Sender<(String, String, String, u64)>,
     pub stats_handle: Arc<StatsHandle>,
-    pub request_log_tx: tokio::sync::mpsc::UnboundedSender<crate::stats::RequestLog>,
+    pub request_log_tx: tokio::sync::mpsc::Sender<crate::stats::RequestLog>,
     pub stats_db_path: String,
     pub http_client: reqwest::Client,
     pub circuit_breaker: Arc<Mutex<HashMap<String, CircuitBreakerState>>>,
@@ -274,7 +274,7 @@ async fn proxy_to_upstream(
                     let total = i + o + c;
                     let model_family = model.split('/').next().unwrap_or(&model).to_string();
                     let hour = chrono::Utc::now().with_timezone(&state.tz).format("%Y-%m-%dT%H:00:00%:z").to_string();
-                    let _ = state.stats_tx.send((api_key.to_string(), model_family, hour, total));
+                    let _ = state.stats_tx.send((api_key.to_string(), model_family, hour, total)).await;
                     (i, o, c)
                 }
                 None => (0, 0, 0),
@@ -311,7 +311,7 @@ async fn proxy_to_upstream(
                 output_tokens,
                 cache_tokens,
                 timestamp: chrono::Utc::now().with_timezone(&state.tz).to_rfc3339(),
-            });
+            }).await;
 
             let mut response = Response::new(Body::from(body_bytes));
             *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -361,7 +361,7 @@ async fn proxy_to_upstream(
                 output_tokens: 0,
                 cache_tokens: 0,
                 timestamp: chrono::Utc::now().with_timezone(&state.tz).to_rfc3339(),
-            });
+            }).await;
             (StatusCode::from_u16(status).unwrap(), format!("upstream error ({})", status)).into_response()
         }
     }

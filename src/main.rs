@@ -233,7 +233,7 @@ async fn main() {
     stats_handle.start();
 
     // Init request log writer
-    let (rl_tx, rl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (rl_tx, rl_rx) = tokio::sync::mpsc::channel(8192);
     let rl_rx = Arc::new(std::sync::Mutex::new(rl_rx));
     stats::RequestLogWriter::init_db(&stats_db);
     stats::spawn_request_log_writer(stats_db.clone(), rl_rx);

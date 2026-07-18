@@ -19,7 +19,7 @@ pub struct UserStat {
 pub struct StatsCollector {
     #[allow(dead_code)]
     db_path: String,
-    pub sender: tokio::sync::mpsc::UnboundedSender<(String, String, String, u64)>,
+    pub sender: tokio::sync::mpsc::Sender<(String, String, String, u64)>,
     #[allow(dead_code)]
     key_owners: Arc<HashMap<String, String>>,
 }
@@ -29,7 +29,7 @@ impl StatsCollector {
         db_path: String,
         key_owners: Arc<HashMap<String, String>>,
     ) -> (Self, StatsHandle) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(8192);
 
         // Init DB schema
         Self::init_db(&db_path);
@@ -51,6 +51,7 @@ impl StatsCollector {
 
     fn init_db(path: &str) {
         let conn = Connection::open(path).expect("failed to open stats db");
+        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS usage (
                 hour     TEXT NOT NULL,
@@ -66,7 +67,7 @@ impl StatsCollector {
 
 pub struct StatsHandle {
     db_path: String,
-    rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<(String, String, String, u64)>>>,
+    rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(String, String, String, u64)>>>,
     key_owners: Arc<HashMap<String, String>>,
 }
 
@@ -220,6 +221,7 @@ pub struct RequestLogWriter;
 impl RequestLogWriter {
     pub fn init_db(path: &str) {
         let conn = Connection::open(path).expect("failed to open stats db");
+        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS request_logs (
                 id            TEXT PRIMARY KEY,
@@ -296,7 +298,7 @@ impl RequestLogWriter {
     }
 }
 
-pub fn spawn_request_log_writer(db_path: String, rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<RequestLog>>>) {
+pub fn spawn_request_log_writer(db_path: String, rx: Arc<Mutex<tokio::sync::mpsc::Receiver<RequestLog>>>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -351,7 +353,7 @@ mod tests {
         StatsCollector::init_db(&path);
         let handle = StatsHandle {
             db_path: path.clone(),
-            rx: Arc::new(Mutex::new(tokio::sync::mpsc::unbounded_channel::<(String, String, String, u64)>().1)),
+            rx: Arc::new(Mutex::new(tokio::sync::mpsc::channel::<(String, String, String, u64)>(8192).1)),
             key_owners: Arc::new(HashMap::new()),
         };
         (path, handle)
@@ -445,7 +447,7 @@ mod tests {
 
         let handle = StatsHandle {
             db_path: path.clone(),
-            rx: Arc::new(Mutex::new(tokio::sync::mpsc::unbounded_channel::<(String, String, String, u64)>().1)),
+            rx: Arc::new(Mutex::new(tokio::sync::mpsc::channel::<(String, String, String, u64)>(8192).1)),
             key_owners: owners,
         };
 
