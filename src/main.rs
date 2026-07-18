@@ -11,6 +11,7 @@ use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, Watcher};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::PathBuf;
+use std::time::Duration;
 
 fn default_config_path() -> String {
     let user = std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "root".to_string());
@@ -256,6 +257,10 @@ async fn main() {
         circuit_breaker,
     };
 
+    // Keep clones to signal shutdown later (drop closes channel → background writers drain)
+    let _stats_shutdown = stats_collector.sender.clone();
+    let _rl_shutdown = rl_tx.clone();
+
     // Start hot-reload watcher
     let reload_state = state.clone();
     let cfg_path = args.config.clone();
@@ -281,7 +286,33 @@ async fn main() {
     tracing::info!("proxy ready on {}", listen_addr);
     let upstream_count = config.read().await.upstreams.len();
     tracing::info!("upstreams configured: {}", upstream_count);
-    axum::serve(listener, app).await.unwrap();
+
+    // Graceful shutdown: SIGINT (ctrl-c) + SIGTERM (unix only)
+    #[cfg(unix)]
+    let shutdown_signal = {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let shutdown_signal = async { tokio::signal::ctrl_c().await.ok(); };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .unwrap();
+
+    // Signal received — close channels so background writers drain & exit
+    tracing::info!("shutting down, draining pending events...");
+    drop(_stats_shutdown);
+    drop(_rl_shutdown);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tracing::info!("shutdown complete");
 }
 
 async fn config_reload_loop(
