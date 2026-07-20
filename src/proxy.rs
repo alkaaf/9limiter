@@ -263,7 +263,7 @@ async fn proxy_to_upstream(
                 .unwrap_or_else(|| header::HeaderValue::from_static("application/json"));
 
             // Read full body to extract token usage, then reconstruct
-            let body_bytes = match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 256 * 1024).await {
+            let body_bytes = match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 5 * 1024 * 1024).await {
                 Ok(b) => b,
                 Err(_) => return (StatusCode::BAD_GATEWAY, "failed to read upstream body").into_response(),
             };

@@ -57,8 +57,8 @@
     <div class="slider-wrap">
       <div class="slider-track"></div>
       <div class="slider-fill" id="slider-fill"></div>
-      <input type="range" id="range-start" min="0" max="100" value="0" step="1">
-      <input type="range" id="range-end" min="0" max="100" value="100" step="1">
+      <input type="range" id="range-start" min="0" max="1176" value="0" step="1">
+      <input type="range" id="range-end" min="0" max="1176" value="1176" step="1">
     </div>
     <div class="time-label" id="time-label">—</div>
   </div>
@@ -74,22 +74,30 @@
   </div>
 </div>
 <script>
-const RANGE_DAYS = 49; // 7 weeks
+const RANGE_HOURS = 1176; // 7 weeks * 24h
 const now = new Date();
-const endDate = new Date(now);
-const startDate = new Date(now);
-startDate.setDate(startDate.getDate() - RANGE_DAYS);
+const endDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), 0, 0, 0));
+const startDate = new Date(endDate.getTime() - RANGE_HOURS * 3600 * 1000);
+
+let _tzOffset = 25200; // +07:00 default
 
 function fmtISO(d) {
-  const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), day = String(d.getDate()).padStart(2,'0');
-  const h = String(d.getHours()).padStart(2,'0');
-  return y+'-'+m+'-'+day+'T'+h+':00:00+07:00';
+  // Apply server timezone offset to get correct date AND hour
+  const localMs = d.getTime() + _tzOffset * 1000;
+  const localD = new Date(localMs);
+  const y = localD.getUTCFullYear(), m = String(localD.getUTCMonth()+1).padStart(2,'0'), day = String(localD.getUTCDate()).padStart(2,'0');
+  const h = String(localD.getUTCHours()).padStart(2,'0');
+  // UTC methods on shifted date = server local time
+  const off = _tzOffset;
+  const sign = off >= 0 ? '+' : '-';
+  const abs = Math.abs(off);
+  const oh = String(Math.floor(abs / 3600)).padStart(2,'0');
+  const om = String(Math.floor((abs % 3600) / 60)).padStart(2,'0');
+  return y+'-'+m+'-'+day+'T'+h+':00:00'+sign+oh+':'+om;
 }
 
 function valToDate(val) {
-  const d = new Date(startDate);
-  d.setHours(d.getHours() + Math.round(val / 100 * RANGE_DAYS * 24));
-  return d;
+  return new Date(startDate.getTime() + val * 3600 * 1000);
 }
 
 const startSlider = document.getElementById('range-start');
@@ -100,17 +108,18 @@ const modelBoard = document.getElementById('model-board');
 const userBoard = document.getElementById('user-board');
 
 function fmtDate(d) {
-  return d.toLocaleDateString('id-ID', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', timeZone:'UTC'});
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[d.getUTCMonth()]+' '+d.getUTCDate()+', '+String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
 }
 
 function update() {
   let s = parseInt(startSlider.value), e = parseInt(endSlider.value);
-  if (s >= e) { if (e < 100) startSlider.value = s = e - 1; else endSlider.value = e = s + 1; }
-  const pctS = s, pctE = e;
+  if (s >= e) { if (e < 1176) startSlider.value = s = e - 1; else endSlider.value = e = s + 1; }
+  const pctS = s / 1176 * 100, pctE = e / 1176 * 100;
   fill.style.left = pctS + '%';
   fill.style.width = (pctE - pctS) + '%';
 
-  const ds = valToDate(pctS), de = valToDate(pctE);
+  const ds = valToDate(s), de = valToDate(e);
   label.textContent = fmtDate(ds) + ' — ' + fmtDate(de);
   fetchStats(fmtISO(ds), fmtISO(de));
 }
@@ -119,6 +128,7 @@ async function fetchStats(start, end) {
   try {
     const r = await fetch('/api/stats?start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end));
     const data = await r.json();
+    if (data.tz_offset !== undefined) _tzOffset = data.tz_offset;
     renderBoard(modelBoard, data.models, 'model', null);
     renderBoard(userBoard, data.users, 'api_key', 'owner');
   } catch(e) {}
@@ -143,7 +153,7 @@ function renderBoard(el, items, nameKey, ownerKey) {
 }
 
 // Clock
-(function tick(){const c=document.getElementById('clock');if(c){const d=new Date();c.textContent=d.toLocaleString('id-ID',{hour12:false,timeZone:'UTC'});}setTimeout(tick,1000);})();
+(function tick(){const c=document.getElementById('clock');if(c){const d=new Date();const off=_tzOffset/3600;const sign=off>=0?'+':'';c.textContent='Timezone '+sign+off.toFixed(0).padStart(2,'0')+':00';}setTimeout(tick,1000);})();
 
 startSlider.addEventListener('change', update);
 endSlider.addEventListener('change', update);

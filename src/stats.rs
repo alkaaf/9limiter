@@ -208,7 +208,8 @@ pub async fn stats_handler(
     let start = params.get("start").cloned().unwrap_or_default();
     let end = params.get("end").cloned().unwrap_or_default();
     let (models, users) = state.stats_handle.query(&start, &end).await;
-    axum::Json(serde_json::json!({ "models": models, "users": users }))
+    let tz_offset = state.tz.local_minus_utc();
+    axum::Json(serde_json::json!({ "models": models, "users": users, "tz_offset": tz_offset }))
 }
 
 pub async fn stats_page_handler() -> impl IntoResponse {
