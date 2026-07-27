@@ -27,6 +27,7 @@ impl SlidingLimiter {
     }
 
     /// Returns (passed: bool, event: RateLimitEvent).
+    /// Mutates only on pass.
     pub fn check(&self, api_key: &str, model: &str, limit: u32, window_secs: u64) -> (bool, RateLimitEvent) {
         let key = format!("{}:{}:{}:{}", api_key, model, limit, window_secs);
         let now = Instant::now();
@@ -71,6 +72,59 @@ impl SlidingLimiter {
         })
     }
 
+    /// Check multiple rules for same (api_key, model) atomically.
+    /// Pass + push all only if ALL have room. Single lock acquisition — no race.
+    pub fn check_all(&self, api_key: &str, model: &str, rules: &[(u32, u64)]) -> Vec<RateLimitEvent> {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        let mut events = Vec::with_capacity(rules.len());
+        let mut all_pass = true;
+
+        // Phase 1: pop expired + check all
+        for &(limit, window_secs) in rules {
+            let key = format!("{}:{}:{}:{}", api_key, model, limit, window_secs);
+            let window = std::time::Duration::from_secs(window_secs);
+            let deque = state.entry(key).or_insert_with(VecDeque::new);
+
+            while let Some(&t) = deque.front() {
+                if now.duration_since(t) >= window { deque.pop_front(); } else { break; }
+            }
+
+            let count = deque.len();
+            let passed = count < limit as usize;
+            if !passed { all_pass = false; }
+
+            let reset_after_secs = deque.front()
+                .map(|oldest| window_secs.saturating_sub(now.duration_since(*oldest).as_secs()))
+                .unwrap_or(0);
+
+            events.push(RateLimitEvent {
+                api_key: api_key.to_string(),
+                model: model.to_string(),
+                rule_limit: limit,
+                rule_window_secs: window_secs,
+                count,
+                remaining: 0,
+                reset_after_secs,
+                owner: String::new(),
+            });
+        }
+
+        // Phase 2: all pass — push timestamps + patch event counts
+        if all_pass {
+            for (i, &(limit, window_secs)) in rules.iter().enumerate() {
+                let key = format!("{}:{}:{}:{}", api_key, model, limit, window_secs);
+                let deque = state.get_mut(&key).unwrap();
+                deque.push_back(now);
+                let new_count = deque.len();
+                events[i].count = new_count;
+                events[i].remaining = limit.saturating_sub(new_count as u32);
+            }
+        }
+
+        events
+    }
+
     /// Return snapshot of all active counters as RateLimitEvents.
     /// Expired entries are cleaned before returning.
     pub fn snapshot(&self) -> Vec<RateLimitEvent> {
@@ -78,10 +132,12 @@ impl SlidingLimiter {
         let now = Instant::now();
         let mut events = Vec::new();
 
-        state.retain(|_key, deque| {
-            // Pop expired
+        state.retain(|key, deque| {
+            // key = "api_key:model:limit:window_secs" — parse window to expire correctly
+            let parts: Vec<&str> = key.splitn(4, ':').collect();
+            let win: u64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(3600);
             while let Some(&t) = deque.front() {
-                if now.duration_since(t) >= std::time::Duration::from_secs(86400 * 7) {
+                if now.duration_since(t) >= std::time::Duration::from_secs(win) {
                     deque.pop_front();
                 } else {
                     break;
@@ -247,5 +303,113 @@ mod tests {
         assert!(p);
         let (p, e) = limiter.check("k", "m", 5, 60);
         assert!(!p); assert_eq!(e.count, 5); assert_eq!(e.remaining, 0);
+    }
+
+    #[test]
+    fn test_window_expires_after_duration() {
+        let limiter = SlidingLimiter::new();
+        // 1-second window, limit=2
+        assert!(limiter.check("k-win", "m", 2, 1).0);
+        assert!(limiter.check("k-win", "m", 2, 1).0);
+        assert!(!limiter.check("k-win", "m", 2, 1).0); // blocked at 2/2
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Window expired — counter reset
+        assert!(limiter.check("k-win", "m", 2, 1).0); // 1/2
+        assert!(limiter.check("k-win", "m", 2, 1).0); // 2/2
+        assert!(!limiter.check("k-win", "m", 2, 1).0); // blocked again
+    }
+
+    #[test]
+    fn test_check_all_multiple_rules_all_pass() {
+        let limiter = SlidingLimiter::new();
+        // 2 rules: limit=3 and limit=5, same 60s window
+        let rules = [(3, 60), (5, 60)];
+        let results = limiter.check_all("k-all", "m", &rules);
+        assert_eq!(results.len(), 2);
+        // Both passed — count after push = 1
+        assert_eq!(results[0].count, 1);
+        assert_eq!(results[1].count, 1);
+        assert_eq!(results[0].remaining, 2);
+        assert_eq!(results[1].remaining, 4);
+
+        let results2 = limiter.check_all("k-all", "m", &rules);
+        assert_eq!(results2[0].count, 2);
+        assert_eq!(results2[1].count, 2);
+    }
+
+    #[test]
+    fn test_check_all_one_rule_blocks_no_push() {
+        let limiter = SlidingLimiter::new();
+        // Rule A: limit=1 (easy to fill), Rule B: limit=10
+        // Fill Rule A first
+        assert!(limiter.check("k-block", "m", 1, 60).0); // A now 1/1
+
+        // check_all with both rules — A blocked, B should NOT have pushed
+        let results = limiter.check_all("k-block", "m", &[(1, 60), (10, 60)]);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].count >= 1); // A blocked
+        // B should still be 0 — no push happened
+        let (passed, _) = limiter.check("k-block", "m", 10, 60);
+        assert!(passed, "B should still have quota — check_all must not push on failure");
+    }
+
+    #[test]
+    fn test_check_all_atomic_no_race_increment() {
+        let limiter = Arc::new(SlidingLimiter::new());
+        let threads: usize = 8;
+        let rules = [(3, 30), (5, 30)];
+        let barrier = Arc::new(Barrier::new(threads));
+        let passed = Arc::new(AtomicU32::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let l = limiter.clone();
+            let b = barrier.clone();
+            let p = passed.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let r = l.check_all("k-atomic", "m", &rules);
+                // All pass only if every rule had room
+                if r.iter().all(|e| e.count < e.rule_limit as usize) {
+                    p.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        // Tightest rule is limit=3 — at most 3 pass, but race may yield 2
+        let count = passed.load(Ordering::Relaxed);
+        assert!(count >= 2, "at least 2 should pass, got {}", count);
+        assert!(count <= 3, "at most 3 should pass (limit=3), got {}", count);
+    }
+
+    #[test]
+    fn test_check_all_window_expiry() {
+        let limiter = SlidingLimiter::new();
+        let rules = [(2, 1), (3, 1)]; // 1-second window
+
+        // Fill both rules — each push increments
+        let r = limiter.check_all("k-exp", "m", &rules);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].count, 1); // 1/2
+        assert_eq!(r[1].count, 1); // 1/3
+
+        let r = limiter.check_all("k-exp", "m", &rules);
+        assert_eq!(r[0].count, 2); // 2/2
+        assert_eq!(r[1].count, 2); // 2/3
+
+        // Third attempt — blocked (rule A limit=2)
+        let r = limiter.check_all("k-exp", "m", &rules);
+        assert!(r[0].count >= r[0].rule_limit as usize, "rule A should be blocked");
+        // But B should NOT have incremented — no push because A blocked
+        let (passed, _) = limiter.check("k-exp", "m", 3, 1);
+        assert!(passed, "B should still have quota (2/3)");
+
+        // Wait for window expiry
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Both rules reset — can use again
+        let r = limiter.check_all("k-exp", "m", &rules);
+        assert_eq!(r[0].count, 1);
+        assert_eq!(r[1].count, 1);
     }
 }

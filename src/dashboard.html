@@ -127,7 +127,7 @@ function connect(){
   const st=document.getElementById('status-text');
   ws.onopen=()=>{dot.className='dot';st.textContent='connected';
     if(syncInt)clearInterval(syncInt);
-    syncInt=setInterval(()=>{ws.send('{"cmd":"sync"}');ws.send('{"cmd":"clock"}')},5000);
+    syncInt=setInterval(()=>{document.getElementById("rate-cards").innerHTML="";ws.send("{\"cmd\":\"sync\"}");ws.send("{\"cmd\":\"clock\"}")},5000);
   };
   ws.onclose=()=>{if(syncInt)clearInterval(syncInt);dot.className='dot disconnected';st.textContent='disconnected';setTimeout(connect,2000)};
   ws.onerror=()=>ws.close();
@@ -143,7 +143,7 @@ function connect(){
 }
 function renderCard(d){
   const c=document.getElementById('rate-cards');
-  const id='card-'+btoa(d.api_key+d.model+d.rule_limit);
+  const id='card-'+btoa(d.api_key+d.model+d.rule_limit+':'+d.rule_window_secs);
   let card=document.getElementById(id);
   if(!card){
     card=document.createElement('div');card.id=id;card.className='key-card';

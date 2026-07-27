@@ -95,23 +95,25 @@ pub async fn proxy_handler(
             .unwrap_or_default()
     };
 
-    for &(limit, window_secs) in &matching_rules {
-        let (passed, event) = state.limiter.check(&api_key, &model, limit, window_secs);
-        let mut event = event; event.owner = state.key_owners.get(&api_key).cloned().unwrap_or_default();
+    // Atomic multi-rule check — one lock, pass only if ALL have room
+    let results = state.limiter.check_all(&api_key, &model, &matching_rules);
+    let blocked = results.iter().any(|e| e.count >= e.rule_limit as usize);
+    let owner = state.key_owners.get(&api_key).cloned().unwrap_or_default();
+    for mut event in results {
+        event.owner = owner.clone();
         let _ = state.event_tx.send(AppEvent::RateLimit(event.clone()));
-        if passed {
-            tracing::debug!("req={} rl=pass limit={} count={}", &req_id[..8], limit, event.count);
-        } else {
+        if blocked {
             send_log(&state.event_tx, "warn",
-                format!("req={} rate-limit BLOCKED ({}/{}) key={:.12} model={} owner={}", &req_id[..8], event.count, limit, &api_key, &model, &event.owner),
+                format!("req={} rate-limit BLOCKED ({}/{}) key={:.12} model={} owner={}", &req_id[..8], event.count, event.rule_limit, &api_key, &model, &event.owner),
                 &state.tz);
             let body = serde_json::json!({
                 "error": "rate_limit_exceeded",
                 "message": format!("Rate limit exceeded for model {}", model),
-                "reset_after_secs": window_secs,
+                "reset_after_secs": event.rule_window_secs,
             });
             return (StatusCode::TOO_MANY_REQUESTS, serde_json::to_string(&body).unwrap()).into_response();
         }
+        tracing::debug!("req={} rl=pass limit={} count={}", &req_id[..8], event.rule_limit, event.count);
     }
 
     // Phase 2: upstream selection (round-robin per prefix group)
