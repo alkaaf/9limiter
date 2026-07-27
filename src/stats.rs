@@ -610,4 +610,99 @@ mod tests {
         RequestLogWriter::init_db(&path); // second call should not fail
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn test_stats_collector_new_creates_working_channel() {
+        let uid = uuid::Uuid::new_v4().to_string();
+        let dir = std::env::temp_dir().join(format!("9limiter_coll_test_{}", uid));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("collector.db").to_string_lossy().to_string();
+        let key_owners = Arc::new(HashMap::new());
+        let (collector, handle) = StatsCollector::new(path.clone(), key_owners.clone());
+
+        // DB initialized (table exists)
+        let conn = Connection::open(&path).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+
+        // sender routes to correct rx
+        collector.sender
+            .try_send(("sk-t".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 42))
+            .unwrap();
+        let mut rx = handle.rx.lock().unwrap();
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received, ("sk-t".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 42));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_request_log_writer_flushes_items() {
+        let uid = uuid::Uuid::new_v4().to_string();
+        let dir = std::env::temp_dir().join(format!("9limiter_spawn_test_{}", uid));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("spawn.db").to_string_lossy().to_string();
+        RequestLogWriter::init_db(&path);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<RequestLog>(8192);
+        let rx = Arc::new(Mutex::new(rx));
+        spawn_request_log_writer(path.clone(), rx.clone());
+
+        let log = RequestLog {
+            id: "spawn-test-1".into(),
+            api_key: "sk-k".into(),
+            owner: "tester".into(),
+            model: "gpt-4".into(),
+            method: "POST".into(),
+            path: "/v1/chat".into(),
+            status: 200,
+            latency_ms: 50,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_tokens: 5,
+            timestamp: "2026-07-16T10:00:00+07:00".into(),
+        };
+        tx.send(log).await.unwrap();
+        drop(tx);
+
+        // Writer loop sleeps 5s then drains
+        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+
+        let results = RequestLogWriter::query_logs(&path, "2000-01-01", "2099-12-31", 200).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "spawn-test-1");
+        assert_eq!(results[0].owner, "tester");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cleanup_removes_old_usage() {
+        let (path, _handle) = tmp_db();
+        let batch = vec![
+            ("sk-old".into(), "gpt-4".into(), "2026-04-01T00:00:00+07:00".into(), 100),
+            ("sk-recent".into(), "gpt-4".into(), "2026-07-16T00:00:00+07:00".into(), 50),
+        ];
+        StatsHandle::flush_batch(&path, &batch).unwrap();
+        StatsHandle::cleanup(&path);
+
+        let conn = Connection::open(&path).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_query_sync_empty_owners_no_panic() {
+        let (path, _handle) = tmp_db();
+        let batch = vec![("sk-k".into(), "gpt-4".into(), "2026-07-16T10:00:00+07:00".into(), 10)];
+        StatsHandle::flush_batch(&path, &batch).unwrap();
+        let owners = HashMap::new();
+        let (models, users) = StatsHandle::query_sync(&path, &owners, "2026-07-16T00:00:00+07:00", "2026-07-17T00:00:00+07:00");
+        assert_eq!(models.len(), 1);
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].owner, "");
+        let _ = std::fs::remove_file(&path);
+    }
 }

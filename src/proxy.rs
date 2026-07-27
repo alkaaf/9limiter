@@ -368,3 +368,270 @@ async fn proxy_to_upstream(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Rule, Config, ApiKeyEntry};
+
+    // ── CircuitBreakerState::is_dead ──
+
+    #[test]
+    fn test_is_dead_no_open_until() {
+        let cb = CircuitBreakerState { failures: 0, open_until: None };
+        assert!(!cb.is_dead());
+    }
+
+    #[test]
+    fn test_is_dead_with_future_time() {
+        let cb = CircuitBreakerState {
+            failures: 0,
+            open_until: Some(std::time::Instant::now() + std::time::Duration::from_secs(3600)),
+        };
+        assert!(cb.is_dead());
+    }
+
+    #[test]
+    fn test_is_dead_with_past_time() {
+        let cb = CircuitBreakerState {
+            failures: 0,
+            open_until: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        };
+        assert!(!cb.is_dead());
+    }
+
+    // ── rule_matches ──
+
+    fn make_rule(models: Vec<&str>, days: Vec<&str>, time_start: &str, time_end: &str) -> Rule {
+        Rule {
+            models: models.into_iter().map(|s| s.to_string()).collect(),
+            limit: 10,
+            window_secs: 60,
+            time_start: time_start.to_string(),
+            time_end: time_end.to_string(),
+            days: days.into_iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_rule_matches_exact_model_and_day_in_window() {
+        let rule = make_rule(vec!["gpt-4"], vec!["Mon"], "09:00", "17:00");
+        assert!(rule_matches(&rule, "gpt-4", "Mon", "12:00"));
+    }
+
+    #[test]
+    fn test_rule_matches_wildcard_model() {
+        let rule = make_rule(vec!["*"], vec!["Mon"], "09:00", "17:00");
+        assert!(rule_matches(&rule, "claude-3", "Mon", "12:00"));
+    }
+
+    #[test]
+    fn test_rule_matches_model_no_match() {
+        let rule = make_rule(vec!["gpt-4"], vec!["Mon"], "09:00", "17:00");
+        assert!(!rule_matches(&rule, "claude-3", "Mon", "12:00"));
+    }
+
+    #[test]
+    fn test_rule_matches_day_no_match() {
+        let rule = make_rule(vec!["gpt-4"], vec!["Mon"], "09:00", "17:00");
+        assert!(!rule_matches(&rule, "gpt-4", "Tue", "12:00"));
+    }
+
+    #[test]
+    fn test_rule_matches_time_before_window() {
+        let rule = make_rule(vec!["gpt-4"], vec!["Mon"], "09:00", "17:00");
+        assert!(!rule_matches(&rule, "gpt-4", "Mon", "08:00"));
+    }
+
+    #[test]
+    fn test_rule_matches_time_at_end_exclusive() {
+        let rule = make_rule(vec!["gpt-4"], vec!["Mon"], "09:00", "17:00");
+        assert!(!rule_matches(&rule, "gpt-4", "Mon", "17:00"));
+    }
+
+    #[test]
+    fn test_rule_matches_time_at_start_inclusive() {
+        let rule = make_rule(vec!["gpt-4"], vec!["Mon"], "09:00", "17:00");
+        assert!(rule_matches(&rule, "gpt-4", "Mon", "09:00"));
+    }
+
+    #[test]
+    fn test_rule_matches_overnight_after_start() {
+        let rule = make_rule(vec!["gpt-4"], vec!["Mon"], "22:00", "07:00");
+        assert!(rule_matches(&rule, "gpt-4", "Mon", "23:30"));
+    }
+
+    #[test]
+    fn test_rule_matches_overnight_before_end() {
+        let rule = make_rule(vec!["gpt-4"], vec!["Mon"], "22:00", "07:00");
+        assert!(rule_matches(&rule, "gpt-4", "Mon", "06:00"));
+    }
+
+    #[test]
+    fn test_rule_matches_overnight_outside() {
+        let rule = make_rule(vec!["gpt-4"], vec!["Mon"], "22:00", "07:00");
+        assert!(!rule_matches(&rule, "gpt-4", "Mon", "12:00"));
+    }
+
+    #[test]
+    fn test_rule_matches_multiple_models() {
+        let rule = make_rule(vec!["gpt-4", "claude-3"], vec!["Mon"], "09:00", "17:00");
+        assert!(rule_matches(&rule, "claude-3", "Mon", "12:00"));
+    }
+
+    // ── lookup_ruleset ──
+
+    fn make_config(api_keys: Vec<(&str, Vec<&str>)>, fallback: Option<&str>) -> Config {
+        Config {
+            listen: None,
+            upstreams: vec![],
+            fallback_ruleset: fallback.map(|s| s.to_string()),
+            rulesets: vec![],
+            api_keys: api_keys
+                .into_iter()
+                .map(|(rs, keys)| ApiKeyEntry {
+                    ruleset: rs.to_string(),
+                    keys: keys.into_iter().map(|k| k.to_string()).collect(),
+                })
+                .collect(),
+            database: None,
+            timezone: None,
+        }
+    }
+
+    #[test]
+    fn test_lookup_ruleset_exact_match() {
+        let config = make_config(vec![("premium", vec!["sk-key1"])], Some("fallback"));
+        assert_eq!(lookup_ruleset(&config, "sk-key1"), Some("premium"));
+    }
+
+    #[test]
+    fn test_lookup_ruleset_fallback() {
+        let config = make_config(vec![], Some("free"));
+        assert_eq!(lookup_ruleset(&config, "unknown-key"), Some("free"));
+    }
+
+    #[test]
+    fn test_lookup_ruleset_no_fallback() {
+        let config = make_config(vec![], None);
+        assert_eq!(lookup_ruleset(&config, "unknown-key"), None);
+    }
+
+    #[test]
+    fn test_lookup_ruleset_key_takes_priority() {
+        let config = make_config(vec![("premium", vec!["sk-key1"])], Some("fallback"));
+        assert_eq!(lookup_ruleset(&config, "sk-key1"), Some("premium"));
+    }
+
+    #[test]
+    fn test_lookup_ruleset_first_match_wins() {
+        let config = make_config(
+            vec![
+                ("premium", vec!["sk-key1", "sk-key2"]),
+                ("free", vec!["sk-key3"]),
+            ],
+            None,
+        );
+        assert_eq!(lookup_ruleset(&config, "sk-key2"), Some("premium"));
+    }
+
+    // ── extract_usage ──
+
+    #[test]
+    fn test_extract_usage_openai_format() {
+        let body = br#"{"usage": {"total_tokens": 150, "prompt_tokens": 100, "completion_tokens": 50}}"#;
+        assert_eq!(extract_usage(body), Some((100, 50, 0)));
+    }
+
+    #[test]
+    fn test_extract_usage_openai_with_cached() {
+        let body = br#"{"usage": {"total_tokens": 200, "prompt_tokens": 150, "completion_tokens": 50, "prompt_tokens_details": {"cached_tokens": 80}}}"#;
+        assert_eq!(extract_usage(body), Some((150, 50, 80)));
+    }
+
+    #[test]
+    fn test_extract_usage_openai_zero_total() {
+        // total_tokens=0 enters OpenAI branch → returns (0, 0, 0)
+        let body = br#"{"usage": {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}}"#;
+        assert_eq!(extract_usage(body), Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn test_extract_usage_openai_missing_prompt_completion() {
+        let body = br#"{"usage": {"total_tokens": 42}}"#;
+        assert_eq!(extract_usage(body), Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn test_extract_usage_anthropic_format() {
+        let body = br#"{"usage": {"input_tokens": 80, "output_tokens": 30}}"#;
+        assert_eq!(extract_usage(body), Some((80, 30, 0)));
+    }
+
+    #[test]
+    fn test_extract_usage_anthropic_with_cached() {
+        let body = br#"{"usage": {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 50}}"#;
+        assert_eq!(extract_usage(body), Some((100, 20, 50)));
+    }
+
+    #[test]
+    fn test_extract_usage_anthropic_zero_tokens() {
+        // inp+out=0 → falls through to None
+        let body = br#"{"usage": {"input_tokens": 0, "output_tokens": 0}}"#;
+        assert_eq!(extract_usage(body), None);
+    }
+
+    #[test]
+    fn test_extract_usage_missing_usage_field() {
+        assert_eq!(extract_usage(br#"{"id": "123"}"#), None);
+    }
+
+    #[test]
+    fn test_extract_usage_empty_body() {
+        assert_eq!(extract_usage(b""), None);
+    }
+
+    #[test]
+    fn test_extract_usage_invalid_json() {
+        assert_eq!(extract_usage(b"not json"), None);
+    }
+
+    #[test]
+    fn test_extract_usage_null_usage() {
+        assert_eq!(extract_usage(br#"{"usage": null}"#), None);
+    }
+
+    #[test]
+    fn test_extract_usage_openai_missing_cached() {
+        // cached defaults to 0 when prompt_tokens_details is absent
+        let body = br#"{"usage": {"total_tokens": 50, "prompt_tokens": 30, "completion_tokens": 20}}"#;
+        assert_eq!(extract_usage(body), Some((30, 20, 0)));
+    }
+
+    // ── extract_model ──
+
+    #[test]
+    fn test_extract_model_found() {
+        assert_eq!(extract_model(br#"{"model": "gpt-4"}"#), Some("gpt-4".to_string()));
+    }
+
+    #[test]
+    fn test_extract_model_missing() {
+        assert_eq!(extract_model(br#"{"id": "123"}"#), None);
+    }
+
+    #[test]
+    fn test_extract_model_invalid_json() {
+        assert_eq!(extract_model(b"not json"), None);
+    }
+
+    #[test]
+    fn test_extract_model_empty_body() {
+        assert_eq!(extract_model(b""), None);
+    }
+
+    #[test]
+    fn test_extract_model_empty_string() {
+        assert_eq!(extract_model(br#"{"model": ""}"#), Some("".to_string()));
+    }
+}
