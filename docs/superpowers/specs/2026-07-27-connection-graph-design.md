@@ -98,7 +98,58 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 - No snapshot, no rate_limit events, no logs
 - `_receiver` is dropped — client cannot send commands
 
-### 3.3 Sidebar in `graph.html`
+### 3.3 WebSocket Data Contract
+
+Server sends these two event types over `/_ws_graph`. Both use `#[serde(tag = "type")]` from the existing `AppEvent` enum — no serialization code needed, no new structs.
+
+#### `type: "request"` (from `AppEvent::Request`)
+
+| Field | Type | Source struct field | Example |
+|-------|------|--------------------|---------|
+| `type` | `"request"` | (enum tag) | |
+| `id` | string | `request: RequestStartEvent.id` | `"abc-123"` |
+| `api_key` | string | `.api_key` | `"sk-proj-8x...a3F2"` |
+| `model` | string | `.model` | `"gpt-4"` |
+| `method` | string | `.method` | `"POST"` |
+| `path` | string | `.path` | `"/v1/chat/completions"` |
+| `owner` | string | `.owner` | `"Alice"` |
+| `timestamp` | string (RFC3339) | `.timestamp` | `"2026-07-27T10:00:00+07:00"` |
+
+```json
+{"type":"request","id":"abc-123","api_key":"sk-proj-8x...a3F2","model":"gpt-4","method":"POST","path":"/v1/chat","owner":"Alice","timestamp":"2026-07-27T10:00:00+07:00"}
+```
+
+Client action: create/update key+model nodes, record RPS, create edge in request phase.
+
+#### `type: "request_end"` (from `AppEvent::RequestEnd`)
+
+| Field | Type | Source struct field | Example |
+|-------|------|--------------------|---------|
+| `type` | `"request_end"` | (enum tag) | |
+| `id` | string | `request_end: RequestEndEvent.id` | `"abc-123"` |
+| `status` | u16 | `.status` | `200` |
+| `latency_ms` | u64 | `.latency_ms` | `850` |
+| `input_tokens` | u64 | `.input_tokens` | `120` |
+| `output_tokens` | u64 | `.output_tokens` | `450` |
+| `cache_tokens` | u64 | `.cache_tokens` | `30` |
+
+```json
+{"type":"request_end","id":"abc-123","status":200,"latency_ms":850,"input_tokens":120,"output_tokens":450,"cache_tokens":30}
+```
+
+Client action: find edge by `id`, compute tps, switch to response phase.
+
+#### What is NOT sent
+
+| Not sent | Reason |
+|----------|--------|
+| `RateLimitEvent` | Dashboard concern, not graph |
+| `LogEvent` | Dashboard concern, not graph |
+| `AppEvent::Log` | Filtered out in handler |
+| Snapshot / `sync` command | Graph is purely event-driven, no polling |
+| `clock` | Graph doesn't display server time |
+
+### 3.4 Sidebar in `graph.html`
 
 Same sidebar pattern as `dashboard.html` and `stats.html`:
 
