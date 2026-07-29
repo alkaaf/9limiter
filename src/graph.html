@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9limiter &mdash; Connection Graph</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f0f1a;color:#e0e0e0;height:100vh;display:flex}
+  .sidebar{width:200px;background:#1a1a2e;border-right:1px solid #2a2a4a;display:flex;flex-direction:column;flex-shrink:0}
+  .sidebar h1{font-size:16px;font-weight:600;padding:16px 20px;border-bottom:1px solid #2a2a4a}
+  .sidebar .links{display:flex;flex-direction:column;padding:8px 0}
+  .sidebar .links a{padding:10px 20px;font-size:13px;color:#888;text-decoration:none;transition:background .15s,color .15s}
+  .sidebar .links a:hover{background:#2a2a4a;color:#e0e0e0}
+  .sidebar .links a.active{color:#e0e0e0;background:#2a2a4a;border-left:3px solid #4fc3f7}
+  .sidebar .bottom{margin-top:auto;padding:12px 16px;font-size:11px;color:#555;font-family:monospace;border-top:1px solid #2a2a4a}
+  .main-wrap{position:relative;flex:1;display:flex;overflow:hidden}
+  #graph-canvas{flex:1;display:block;width:100%;height:100%}
+  .header-overlay{position:absolute;top:0;left:200px;right:0;display:flex;align-items:center;justify-content:space-between;padding:8px 20px;background:#1a1a2e;border-bottom:1px solid #2a2a4a;z-index:10}
+  .header-overlay .status{display:flex;align-items:center;gap:12px;font-size:13px;color:#888}
+  .header-overlay .status .dot{width:8px;height:8px;border-radius:50%;background:#4caf50}
+  .header-overlay .status .dot.disconnected{background:#f44336}
+  .legend-overlay{position:absolute;bottom:16px;left:216px;font-size:11px;color:#aaa;background:rgba(15,15,26,.85);padding:10px 14px;border-radius:6px;border:1px solid #2a2a4a;z-index:10;line-height:1.6}
+  .legend-overlay .key{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}
+  .legend-overlay .key.orange{background:#e65100}
+  .legend-overlay .key.blue{background:#1565c0}
+  .empty-state{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#555;font-size:18px;z-index:5;pointer-events:none}
+</style>
+</head>
+<body>
+<div class="sidebar">
+  <h1>9limiter</h1>
+  <div class="links">
+    <a href="/dashboard">Dashboard</a>
+    <a href="/stats">Stats</a>
+    <a href="/graph" class="active">Graph</a>
+  </div>
+  <div class="bottom">
+    <span id="clock">--:--:--</span>
+  </div>
+</div>
+<div class="main-wrap">
+  <div class="header-overlay">
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="status-text">connecting&hellip;</span>
+    </div>
+    <div class="status" id="header-stats">
+      <span>🔑 <strong id="keys-count">0</strong> keys</span>
+      <span>📦 <strong id="models-count">0</strong> models</span>
+      <span>🔗 <strong id="active-count">0</strong> active</span>
+      <span>⚡ <strong id="tps-avg">0</strong> t/s avg</span>
+      <span>📊 <strong id="rps-total">0</strong> req/s total</span>
+    </div>
+  </div>
+  <canvas id="graph-canvas"></canvas>
+  <div class="empty-state" id="empty-state">Waiting for connections...</div>
+  <div class="legend-overlay">
+    <span class="key orange"></span> API Key &nbsp;
+    <span class="key blue"></span> Model<br>
+    ◻ Node size = req/s &nbsp; <span style="color:#66bb6a">—</span> High t/s (&gt;500) &nbsp;
+    <span style="color:#ffb74d">—</span> Med (50-500) &nbsp;
+    <span style="color:#f44336">—</span> Low (&lt;50)
+  </div>
+</div>
+<script>
+// WS connection
+let ws = null;
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/_ws_graph');
+  const dot = document.getElementById('dot');
+  const st = document.getElementById('status-text');
+  ws.onopen = () => { dot.className = 'dot'; st.textContent = 'connected'; };
+  ws.onclose = () => {
+    dot.className = 'dot disconnected'; st.textContent = 'disconnected';
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = msg => {
+    try { handleEvent(JSON.parse(msg.data)); } catch (_) {}
+  };
+}
+connect();
+
+// Data stores
+const RPS_WINDOW_MS = 2000;
+const NODE_TIMEOUT_MS = 3000; // 3 detik idle lalu ilang (edge tetap linger)
+const DEAD_FRAMES = 3600; // ~60 detik (3600 frame * ~16ms)
+let keyNodes = {};
+let modelNodes = {};
+let edges = [];
+let nodeOrder = { keys: [], models: [] };
+
+function handleEvent(e) {
+  if (e.type === 'request') {
+    if (!keyNodes[e.api_key]) {
+      keyNodes[e.api_key] = { id: e.api_key, owner: e.owner || '', rps: 0, rpsQueue: [], connections: new Set() };
+      nodeOrder.keys.push(e.api_key);
+    }
+    keyNodes[e.api_key].rpsQueue.push(performance.now());
+
+    if (!modelNodes[e.model]) {
+      modelNodes[e.model] = { id: e.model, rps: 0, rpsQueue: [], connections: new Set() };
+      nodeOrder.models.push(e.model);
+    }
+    modelNodes[e.model].rpsQueue.push(performance.now());
+
+    const edge = {
+      id: e.id,
+      keyId: e.api_key,
+      modelId: e.model,
+      phase: 'request',
+      progress: 0,
+      inp: 0, out: 0, total: 0,
+      latencyMs: 0,
+      tps: 0,
+      reqSpeed: 0.02,
+      resSpeed: 0.02,
+      alive: true,
+      deadFrames: 0,
+    };
+    edges.push(edge);
+    keyNodes[e.api_key].connections.add(edge.id);
+    modelNodes[e.model].connections.add(edge.id);
+
+  } else if (e.type === 'request_end') {
+    const edge = edges.find(ed => ed.id === e.id);
+    if (!edge) return;
+    edge.latencyMs = e.latency_ms || 0;
+    edge.inp = e.input_tokens || 0;
+    edge.out = e.output_tokens || 0;
+    edge.total = edge.inp + edge.out + (e.cache_tokens || 0);
+    if (edge.latencyMs > 0) {
+      edge.tps = edge.total / (edge.latencyMs / 1000);
+    }
+    const dt = edge.latencyMs / 1000 || 0.001;
+    edge.reqSpeed = Math.min(0.06, Math.max(0.002, edge.inp / dt / 50000));
+    edge.resSpeed = Math.min(0.06, Math.max(0.002, edge.out / dt / 50000));
+    edge.phase = 'response';
+    edge.progress = 0;
+  }
+  if (edges.length > 1000) edges.splice(0, edges.length - 1000);
+}
+
+// Canvas render
+const canvas = document.getElementById('graph-canvas');
+const ctx = canvas.getContext('2d');
+const PAD_LEFT = 130;
+const PAD_TOP = 90;
+const PAD_BOTTOM = 80;
+const PAD_RIGHT = 160;
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function updateRps() {
+  const now = performance.now();
+  for (const id of nodeOrder.keys) {
+    const n = keyNodes[id];
+    if (!n) continue;
+    n.rpsQueue = n.rpsQueue.filter(t => now - t < RPS_WINDOW_MS);
+    n.rps = n.rpsQueue.length / (RPS_WINDOW_MS / 1000);
+  }
+  for (const id of nodeOrder.models) {
+    const n = modelNodes[id];
+    if (!n) continue;
+    n.rpsQueue = n.rpsQueue.filter(t => now - t < RPS_WINDOW_MS);
+    n.rps = n.rpsQueue.length / (RPS_WINDOW_MS / 1000);
+  }
+}
+
+function nodeRadius(rps) {
+  // base 18px, grows gently — min 16, max 44
+  // rps 0→18, rps 1→22, rps 3→30, rps 5→38, rps 10→44
+  return Math.min(44, Math.max(16, 18 + Math.round(Math.sqrt(rps) * 8)));
+}
+
+function tpsToSpeed(tps) {
+  return Math.min(0.06, Math.max(0.002, tps / 50000));
+}
+
+function getSpeedColor(tps, alpha) {
+  if (tps > 500) return `rgba(102, 187, 106, ${alpha})`;
+  if (tps > 50)  return `rgba(255, 183, 77, ${alpha})`;
+  return `rgba(244, 67, 54, ${alpha})`;
+}
+
+function getWidth(tps) {
+  if (tps > 500) return 3.5;
+  if (tps > 50)  return 2.5;
+  return 1.5;
+}
+
+function getNodeY(index, total, height) {
+  const usable = height - PAD_TOP - PAD_BOTTOM;
+  if (total === 0) return PAD_TOP + usable / 2;
+  const spacing = usable / total;
+  return PAD_TOP + spacing * (index + 0.5);
+}
+
+function tick() {
+  updateRps();
+  const now = performance.now();
+
+  for (let i = edges.length - 1; i >= 0; i--) {
+    const e = edges[i];
+    if (!e.alive) {
+      e.deadFrames++;
+      if (e.deadFrames > DEAD_FRAMES) { edges.splice(i, 1); }
+      continue;
+    }
+    if (e.phase === 'request') {
+      e.progress += e.reqSpeed || 0.002;
+      if (e.progress >= 1) {
+        e.phase = 'response';
+        e.progress = 0;
+      }
+    } else if (e.phase === 'response') {
+      e.progress += e.resSpeed || 0.002;
+      if (e.progress >= 1) {
+        e.alive = false;
+        e.deadFrames = 0;
+        // snap positions when edge dies — survives node cleanup
+        const ki = nodeOrder.keys.indexOf(e.keyId);
+        const mi = nodeOrder.models.indexOf(e.modelId);
+        e._ky = ki !== -1 ? getNodeY(ki, nodeOrder.keys.length, canvas.height) : canvas.height/2;
+        e._my = mi !== -1 ? getNodeY(mi, nodeOrder.models.length, canvas.height) : canvas.height/2;
+      }
+    }
+  }
+
+  // idle node cleanup (30s no rps)
+  for (const id of nodeOrder.keys) {
+    if (keyNodes[id] && keyNodes[id].rps === 0) {
+      const last = keyNodes[id].rpsQueue[keyNodes[id].rpsQueue.length - 1] || 0;
+      if (now - last > NODE_TIMEOUT_MS) {
+        delete keyNodes[id];
+        nodeOrder.keys = nodeOrder.keys.filter(k => k !== id);
+      }
+    }
+  }
+  for (const id of nodeOrder.models) {
+    if (modelNodes[id] && modelNodes[id].rps === 0) {
+      const last = modelNodes[id].rpsQueue[modelNodes[id].rpsQueue.length - 1] || 0;
+      if (now - last > NODE_TIMEOUT_MS) {
+        delete modelNodes[id];
+        nodeOrder.models = nodeOrder.models.filter(m => m !== id);
+      }
+    }
+  }
+
+  draw();
+  requestAnimationFrame(tick);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const totalKeys = nodeOrder.keys.length;
+  const totalModels = nodeOrder.models.length;
+  const kx = PAD_LEFT;
+  const mx = canvas.width - PAD_RIGHT;
+
+  // header stats
+  const activeEdges = edges.filter(e => e.alive);
+  let tpsSum = 0, tpsCount = 0;
+  for (const e of activeEdges) { if (e.tps > 0) { tpsSum += e.tps; tpsCount++; } }
+  const tpsAvg = tpsCount > 0 ? Math.round(tpsSum / tpsCount) : 0;
+  let rpsTotal = 0;
+  for (const id of nodeOrder.keys) { rpsTotal += keyNodes[id]?.rps || 0; }
+  for (const id of nodeOrder.models) { rpsTotal += modelNodes[id]?.rps || 0; }
+
+  document.getElementById('keys-count').textContent = totalKeys;
+  document.getElementById('models-count').textContent = totalModels;
+  document.getElementById('active-count').textContent = activeEdges.length;
+  document.getElementById('tps-avg').textContent = tpsAvg;
+  document.getElementById('rps-total').textContent = (Math.round(rpsTotal * 10) / 10);
+
+  const empty = document.getElementById('empty-state');
+  empty.style.display = (totalKeys === 0 && totalModels === 0) ? '' : 'none';
+
+  // Draw edges
+  const time = performance.now();
+  for (const e of edges) {
+    if (!e.alive && e.deadFrames === 0) continue;
+
+    // Use cached Y for dead edges (node may be cleaned up), live edges compute fresh
+    let ky, my;
+    if (!e.alive && e._ky !== undefined) {
+      ky = e._ky;
+      my = e._my;
+    } else {
+      const ki = nodeOrder.keys.indexOf(e.keyId);
+      const mi = nodeOrder.models.indexOf(e.modelId);
+      if (ki === -1 || mi === -1) continue;
+      ky = getNodeY(ki, totalKeys, canvas.height);
+      my = getNodeY(mi, totalModels, canvas.height);
+    }
+    const sx = e.phase === 'request' ? kx : mx;
+    const sy = e.phase === 'request' ? ky : my;
+    const ex = e.phase === 'request' ? mx : kx;
+    const ey = e.phase === 'request' ? my : ky;
+    const p = e.progress;
+    const dotX = sx + (ex - sx) * p;
+    const dotY = sy + (ey - sy) * p;
+    const color = getSpeedColor(e.tps || 0, e.alive ? 1 : 0.3);
+    const width = getWidth(e.tps || 0);
+
+    // Line with moving dashes
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.setLineDash([8, 6]);
+    ctx.lineDashOffset = -time / 30;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    ctx.restore();
+
+    // Moving glow dot
+    ctx.save();
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(dotX, dotY, Math.min(4 + width, 8), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Key nodes (left)
+  for (let i = 0; i < nodeOrder.keys.length; i++) {
+    const id = nodeOrder.keys[i];
+    const n = keyNodes[id];
+    if (!n) continue;
+    const y = getNodeY(i, totalKeys, canvas.height);
+    const r = nodeRadius(n.rps);
+    const glow = n.connections.size > 0 ? 18 : Math.min(8, r * 0.3);
+
+    ctx.save();
+    ctx.shadowColor = '#ffb74d';
+    ctx.shadowBlur = glow;
+    const grad = ctx.createRadialGradient(kx - 4, y - 4, 0, kx, y, r);
+    grad.addColorStop(0, '#ffb74d');
+    grad.addColorStop(1, '#e65100');
+    ctx.beginPath();
+    ctx.arc(kx, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.restore();
+
+    ctx.fillStyle = '#aaa';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'right';
+    const label = n.id.length > 14 ? n.id.slice(0, 14) + '..' : n.id;
+    ctx.fillText(label, kx - r - 6, y - 2);
+    ctx.font = '10px sans-serif';
+    if (n.owner) ctx.fillText(n.owner, kx - r - 6, y + 10);
+
+    if (n.rps > 0.5) {
+      ctx.fillStyle = '#e0e0e0';
+      ctx.font = 'bold 10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(Math.round(n.rps * 10) / 10 + ' r/s', kx, y + r + 14);
+    }
+  }
+
+  // Model nodes (right)
+  for (let i = 0; i < nodeOrder.models.length; i++) {
+    const id = nodeOrder.models[i];
+    const n = modelNodes[id];
+    if (!n) continue;
+    const y = getNodeY(i, totalModels, canvas.height);
+    const r = nodeRadius(n.rps);
+    const glow = n.connections.size > 0 ? 18 : Math.min(8, r * 0.3);
+
+    ctx.save();
+    ctx.shadowColor = '#81d4fa';
+    ctx.shadowBlur = glow;
+    const grad = ctx.createRadialGradient(mx - 4, y - 4, 0, mx, y, r);
+    grad.addColorStop(0, '#81d4fa');
+    grad.addColorStop(1, '#1565c0');
+    ctx.beginPath();
+    ctx.arc(mx, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.restore();
+
+    ctx.fillStyle = '#aaa';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'left';
+    const label = n.id.length > 16 ? n.id.slice(0, 16) + '..' : n.id;
+    ctx.fillText(label, mx + r + 6, y + 4);
+
+    if (n.rps > 0.5) {
+      ctx.fillStyle = '#e0e0e0';
+      ctx.font = 'bold 10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(Math.round(n.rps * 10) / 10 + ' r/s', mx, y + r + 14);
+    }
+  }
+}
+
+// Clock
+setInterval(() => {
+  const d = new Date();
+  document.getElementById('clock').textContent = d.toLocaleTimeString('id-ID', {hour12: false});
+}, 1000);
+
+tick();
+</script>
+</body>
+</html>

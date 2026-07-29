@@ -5,6 +5,7 @@ mod proxy;
 mod dashboard;
 mod db;
 mod stats;
+mod graph;
 
 use clap::{Parser, Subcommand};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, Watcher};
@@ -273,6 +274,8 @@ async fn main() {
         .route("/api/stats", axum::routing::get(stats::stats_handler))
         .route("/api/requests", axum::routing::get(stats::requests_handler))
         .route("/_ws", axum::routing::get(dashboard::ws_handler))
+        .route("/graph", axum::routing::get(graph::graph_page_handler))
+        .route("/_ws_graph", axum::routing::get(graph::graph_ws_handler))
         .fallback(proxy::proxy_handler)
         .with_state(state);
 

@@ -139,6 +139,31 @@ Client action: create/update key+model nodes, record RPS, create edge in request
 
 Client action: find edge by `id`, compute tps, switch to response phase.
 
+#### Emit Locations in Code
+
+Both events are emitted from `proxy_to_upstream()` in `src/proxy.rs`. The existing `event_tx` broadcast channel carries them to all WS subscribers.
+
+| Event | File | Line | Context |
+|-------|------|------|---------|
+| `AppEvent::Request` (type:"request") | `src/proxy.rs` | 238 | After auth+rate-limit pass, **before** `upstream_req.send().await`. Edge appears on graph immediately when request starts. |
+| `AppEvent::RequestEnd` (type:"request_end") success path | `src/proxy.rs` | 295 | After `extract_usage()` — body fully read. `latency_ms` = time from start to response fully received. `input_tokens`/`output_tokens` from upstream response JSON. |
+| `AppEvent::RequestEnd` (type:"request_end") error path | `src/proxy.rs` | 345 | On upstream timeout/connection error. `latency_ms` = time until error. `input_tokens`/`output_tokens` = 0. `status` = 502 or 504. |
+
+**Timeline for a single request:**
+```
+t=0     Client sends request to proxy
+t=0     proxy_handler receives → auth → rate-limit check → upstream select
+t=0     proxy_to_upstream called
+t=0+    event_tx: AppEvent::Request          ← graph creates edge (phase=request)
+t=0+    upstream_req.send().await starts      ← actual HTTP call to OpenAI/Anthropic
+t=N     Response received
+t=N     extract_usage() from response body
+t=N     event_tx: AppEvent::RequestEnd        ← graph switches edge to (phase=response)
+t=N+    Response sent back to client
+```
+
+Graph receives both events near-instant (broadcast channel, in-memory). The time between request and request_end events at the WS layer is the real upstream latency — no additional proxy overhead.
+
 #### What is NOT sent
 
 | Not sent | Reason |
